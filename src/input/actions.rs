@@ -931,6 +931,7 @@ impl State {
                 &self.common.config,
                 self.common.event_loop_handle.clone(),
             ),
+
             // NOTE: implementation currently assumes actions that apply to outputs should apply to the active output
             // rather than the output that has keyboard focus
             Action::ToggleOrientation => {
