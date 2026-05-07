@@ -977,6 +977,109 @@ impl KmsGuard<'_> {
                             );
                         }
 
+                        // HDR signaling: Colorspace=BT2020_RGB + HDR_OUTPUT_METADATA blob.
+                        // Phase 1 of HDR support — gets the panel into HDR mode at the
+                        // KMS level. SDR client content rendered in this mode looks
+                        // dim/washed until Phase 2 (SDR→HDR tone-up shader pass) lands;
+                        // for that reason this is opt-in per-output and defaults to off.
+                        //
+                        // The HDR state goes through smithay's `DrmSurface::set_hdr_state`
+                        // (forked at /home/jakes/Projects/Lilypad\ Cosmic/smithay) so it
+                        // gets included in every atomic commit. Writing the props directly
+                        // via legacy `set_property` was getting clobbered on the next
+                        // render flip because smithay's atomic state didn't track them.
+                        match output_config.0.hdr_enabled {
+                            Some(true) => {
+                                if drm_helpers::connector_supports_hdr(drm.device(), conn) {
+                                    // Bump max_bpc to at least 10 — HDR with 8 bpc bands visibly.
+                                    if let Err(err) = drm_helpers::set_max_bpc(drm.device(), conn, 10) {
+                                        warn!(
+                                            ?err,
+                                            "Failed to bump max_bpc to 10 for HDR on connector: {}",
+                                            surface.output.name()
+                                        );
+                                    }
+                                    // Resolve enum value + create blob; both go into HdrState.
+                                    let setup_result = (|| -> anyhow::Result<smithay::backend::drm::HdrState> {
+                                        let colorspace_value = drm_helpers::colorspace_enum_value(
+                                            drm.device(),
+                                            conn,
+                                            "BT2020_RGB",
+                                        )?;
+                                        let lum =
+                                            drm_helpers::HdrMasteringLuminance::fallback_oled();
+                                        let metadata_blob_id =
+                                            drm_helpers::create_hdr_metadata_blob(drm.device(), lum)?;
+                                        Ok(smithay::backend::drm::HdrState {
+                                            colorspace_value,
+                                            metadata_blob_id,
+                                        })
+                                    })();
+                                    match setup_result {
+                                        Ok(hdr_state) => {
+                                            let compositor_ref = drm
+                                                .compositors()
+                                                .get(crtc)
+                                                .unwrap()
+                                                .lock()
+                                                .unwrap();
+                                            match compositor_ref
+                                                .surface()
+                                                .set_hdr_state(conn, Some(hdr_state))
+                                            {
+                                                Ok(()) => tracing::info!(
+                                                    output = %surface.output.name(),
+                                                    colorspace_value = hdr_state.colorspace_value,
+                                                    metadata_blob_id = hdr_state.metadata_blob_id,
+                                                    "HDR signaling staged for next atomic commit (Colorspace=BT2020_RGB, ST 2084 PQ)"
+                                                ),
+                                                Err(err) => warn!(
+                                                    ?err,
+                                                    "Failed to stage HDR state on smithay surface: {}",
+                                                    surface.output.name()
+                                                ),
+                                            }
+                                        }
+                                        Err(err) => warn!(
+                                            ?err,
+                                            "Failed to prepare HDR state for connector: {}",
+                                            surface.output.name()
+                                        ),
+                                    }
+                                } else {
+                                    warn!(
+                                        "HDR requested but connector {} doesn't advertise BT2020_RGB + HDR_OUTPUT_METADATA properties; leaving in SDR",
+                                        surface.output.name()
+                                    );
+                                }
+                            }
+                            Some(false) | None => {
+                                // Stage explicit SDR state through smithay so the next commit
+                                // clears Colorspace → Default and HDR_OUTPUT_METADATA → 0.
+                                // We send `Some(HdrState::sdr())` rather than `None` because
+                                // `None` would just stop *tracking*, leaving the kernel's last
+                                // values in place — we want an active transition to SDR.
+                                if drm_helpers::connector_supports_hdr(drm.device(), conn) {
+                                    let compositor_ref = drm
+                                        .compositors()
+                                        .get(crtc)
+                                        .unwrap()
+                                        .lock()
+                                        .unwrap();
+                                    if let Err(err) = compositor_ref.surface().set_hdr_state(
+                                        conn,
+                                        Some(smithay::backend::drm::HdrState::sdr()),
+                                    ) {
+                                        warn!(
+                                            ?err,
+                                            "Failed to stage SDR (HDR-off) state on connector: {}",
+                                            surface.output.name()
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
                         let vrr = output_config.0.vrr;
                         std::mem::drop(output_config);
 

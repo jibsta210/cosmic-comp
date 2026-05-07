@@ -149,4 +149,10 @@ cosmic-settings-config = { git = "https://github.com/jibsta210/cosmic-settings-d
 cosmic-settings-daemon-config = { git = "https://github.com/jibsta210/cosmic-settings-daemon", branch = "feat/lilypad-patches" }
 
 [patch.crates-io]
-smithay = { git = "https://github.com/smithay/smithay.git", rev = "211c19d" }
+# HDR experiment: use a local smithay fork that adds per-connector HDR state
+# (Colorspace + HDR_OUTPUT_METADATA) to atomic commits. Branch
+# `feat/hdr-experiment` rebased on cosmic-comp's pinned upstream rev 211c19d.
+# This patch is ONLY on cosmic-comp's `feat/hdr-experiment` branch — the
+# `feat/lilypad-patches` branch (auto-installed to /usr/bin/cosmic-comp by the
+# pacman hook) keeps the upstream smithay.
+smithay = { path = "../smithay" }

@@ -298,6 +298,179 @@ pub fn set_max_bpc(dev: &impl ControlDevice, conn: connector::Handle, bpc: u32) 
     })
 }
 
+// =====================================================================
+// HDR signaling: Colorspace + HDR_OUTPUT_METADATA
+// =====================================================================
+//
+// To put an HDR-capable display into HDR mode, the compositor needs to:
+//   1. Set the connector's `Colorspace` enum property to a wide-gamut option
+//      (we use BT2020_RGB; DCI-P3_RGB_D65 is also valid for some panels).
+//   2. Write an `HDR_OUTPUT_METADATA` blob containing an HDMI HDR Static
+//      Metadata Type 1 InfoFrame (CTA-861.3 / BT.2100 mastering metadata)
+//      describing the source content's EOTF (PQ/HLG) and luminance range.
+//   3. Ensure max bpc >= 10 so the PQ curve doesn't band visibly.
+//
+// Without (2), most panels stay in SDR mode regardless of (1). Without (1),
+// the panel ignores (2). Both must be set in the same atomic commit (or a
+// quick succession) for the panel to switch into HDR mode.
+//
+// Reference: include/uapi/linux/drm/drm_mode.h (struct hdr_output_metadata,
+// struct hdr_metadata_infoframe), CTA-861.3, BT.2100.
+
+/// Kernel UAPI struct for the `HDR_OUTPUT_METADATA` connector blob property.
+/// Layout matches `struct hdr_output_metadata` in `drm_mode.h` byte-for-byte.
+///
+/// **Critical**: the kernel struct interleaves primaries as
+/// `struct { u16 x, y; } display_primaries[3]` — in memory `r.x, r.y, g.x,
+/// g.y, b.x, b.y`. Not separate `x[3]` / `y[3]` arrays! Earlier versions of
+/// this code had separate arrays which produced a garbled layout and caused
+/// atomic commits to fail (panel firmware rejected the bad InfoFrame and
+/// rendering froze).
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct HdrOutputMetadata {
+    /// 0 = HDR_OUTPUT_METADATA_TYPE1 (the only kind defined as of 6.x)
+    metadata_type: u32,
+    // ↓ struct hdr_metadata_infoframe begins here
+    /// 0 = traditional SDR gamma, 1 = traditional HDR gamma,
+    /// 2 = SMPTE ST 2084 (PQ), 3 = HLG.
+    eotf: u8,
+    /// Always 0 for "static metadata".
+    static_metadata_type: u8,
+    /// Display primaries in 0.00002 chromaticity units (50000 = 1.0).
+    /// Layout: `[r_x, r_y, g_x, g_y, b_x, b_y]` — kernel reads as
+    /// `struct { u16 x, y; } display_primaries[3]`.
+    display_primaries: [u16; 6],
+    /// Reference white point chromaticity in same units, layout `[x, y]`.
+    white_point: [u16; 2],
+    /// Mastering display peak luminance in cd/m^2 (nits).
+    max_display_mastering_luminance: u16,
+    /// Mastering display min luminance in 0.0001 cd/m^2 units
+    /// (i.e. 1 = 0.0001 nits = a real OLED black; 5 = 0.0005 nits).
+    min_display_mastering_luminance: u16,
+    /// Maximum Content Light Level (peak brightest pixel) in cd/m^2.
+    max_cll: u16,
+    /// Maximum Frame Average Light Level (frame avg) in cd/m^2.
+    max_fall: u16,
+}
+
+/// EOTF: SMPTE ST 2084 (PQ) — the modern HDR standard used by HDR10 etc.
+const EOTF_PQ: u8 = 2;
+
+// BT.2020 / BT.2100 mastering display primaries in 0.00002 chromaticity units
+// (50000 = 1.0). Layout: r_x, r_y, g_x, g_y, b_x, b_y — interleaved per the
+// kernel's `display_primaries[3]` struct array.
+const BT2020_PRIMARIES: [u16; 6] = [
+    35400, 14600, // R: 0.708, 0.292
+    8500, 39850, // G: 0.170, 0.797
+    6550, 2300, // B: 0.131, 0.046
+];
+// D65 reference white in same units, [x, y].
+const D65_WHITE: [u16; 2] = [15635, 16450]; // 0.3127, 0.3290
+
+/// Per-output mastering luminance bounds, in the units the kernel expects.
+/// Derived from the panel's EDID HDR static metadata block (Phase 1.5);
+/// for now callers can hand-pass values gleaned from `edid-decode`.
+#[derive(Debug, Clone, Copy)]
+pub struct HdrMasteringLuminance {
+    /// Peak luminance in cd/m^2 (e.g. 525 for an OLED with 525 nit peak).
+    pub max_lum_nits: u16,
+    /// Min luminance in 0.0001 cd/m^2 units (e.g. 5 for OLED with 0.0005 nit blacks).
+    pub min_lum_units: u16,
+    /// MaxCLL — peak pixel cd/m^2. Usually equal to or less than max_lum_nits.
+    pub max_cll_nits: u16,
+    /// MaxFALL — frame-average peak cd/m^2. Usually less than max_cll.
+    pub max_fall_nits: u16,
+}
+
+impl HdrMasteringLuminance {
+    /// Conservative defaults for an HDR-capable OLED panel where the EDID
+    /// block hasn't been parsed yet. Tuned for ~500 nit OLEDs (close to
+    /// jake's panel; safe-ish for most laptop OLEDs).
+    pub fn fallback_oled() -> Self {
+        Self {
+            max_lum_nits: 500,
+            min_lum_units: 5, // 0.0005 nits
+            max_cll_nits: 500,
+            max_fall_nits: 400,
+        }
+    }
+}
+
+/// Build the raw bytes of an HDR_OUTPUT_METADATA blob describing PQ-encoded
+/// HDR content with BT.2020 primaries and D65 white, mastered to the given
+/// luminance bounds. Resulting buffer goes into `Device::create_property_blob`.
+fn build_hdr_metadata_blob(lum: HdrMasteringLuminance) -> Vec<u8> {
+    let m = HdrOutputMetadata {
+        metadata_type: 0, // HDR_OUTPUT_METADATA_TYPE1
+        eotf: EOTF_PQ,
+        static_metadata_type: 0,
+        display_primaries: BT2020_PRIMARIES,
+        white_point: D65_WHITE,
+        max_display_mastering_luminance: lum.max_lum_nits,
+        min_display_mastering_luminance: lum.min_lum_units,
+        max_cll: lum.max_cll_nits,
+        max_fall: lum.max_fall_nits,
+    };
+    let bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(
+            (&m as *const HdrOutputMetadata) as *const u8,
+            std::mem::size_of::<HdrOutputMetadata>(),
+        )
+    };
+    bytes.to_vec()
+}
+
+/// Look up the raw u64 value of a `Colorspace` enum variant by name on the
+/// given connector. Used by the HDR setup path which hands the value to
+/// `smithay::backend::drm::surface::HdrState::colorspace_value`.
+pub fn colorspace_enum_value(
+    dev: &impl ControlDevice,
+    conn: connector::Handle,
+    variant_name: &str,
+) -> Result<u64> {
+    let prop_handle = get_prop(dev, conn, "Colorspace")?;
+    let info = dev.get_property(prop_handle)?;
+    let variants = match info.value_type() {
+        property::ValueType::Enum(values) => values,
+        _ => return Err(anyhow!("Colorspace has wrong value type")),
+    };
+    // `EnumValues::values()` returns `(&[u64], &[EnumValue])`.
+    variants
+        .values()
+        .1
+        .iter()
+        .find(|v| v.name().to_str().ok() == Some(variant_name))
+        .map(|v| v.value())
+        .ok_or_else(|| anyhow!("Colorspace enum has no variant {variant_name:?}"))
+}
+
+/// Returns true if the connector advertises the property surface required to
+/// drive HDR signaling (BT2020_RGB Colorspace variant + HDR_OUTPUT_METADATA).
+pub fn connector_supports_hdr(dev: &impl ControlDevice, conn: connector::Handle) -> bool {
+    if get_prop(dev, conn, "HDR_OUTPUT_METADATA").is_err() {
+        return false;
+    }
+    colorspace_enum_value(dev, conn, "BT2020_RGB").is_ok()
+}
+
+/// Build an `HDR_OUTPUT_METADATA` blob (PQ + BT.2020 + supplied luminance) and
+/// return its raw u64 ID for use with smithay's `HdrState::metadata_blob_id`.
+///
+/// The kernel cleans the blob up automatically when the DRM master is dropped.
+/// If callers want to free earlier (e.g. when toggling HDR off mid-session),
+/// they can call `device.destroy_property_blob(id)`.
+pub fn create_hdr_metadata_blob(
+    dev: &impl ControlDevice,
+    lum: HdrMasteringLuminance,
+) -> Result<u64> {
+    let bytes = build_hdr_metadata_blob(lum);
+    let blob = dev
+        .create_property_blob(&bytes)
+        .context("create HDR_OUTPUT_METADATA blob")?;
+    Ok(blob.into())
+}
+
 pub fn panel_orientation(dev: &impl ControlDevice, conn: connector::Handle) -> Result<Transform> {
     let (val_type, val) = get_property_val(dev, conn, "panel orientation")?;
     match val_type.convert_value(val) {

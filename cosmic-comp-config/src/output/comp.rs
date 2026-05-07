@@ -51,6 +51,24 @@ pub struct OutputConfig {
     pub max_bpc: Option<u32>,
     #[serde(default)]
     pub xwayland_primary: bool,
+    /// HDR output mode for this connector. When `true`, on connectors that
+    /// advertise HDR capabilities (`Colorspace` enum supporting `BT2020_RGB`
+    /// + `HDR_OUTPUT_METADATA` blob property + EDID HDR static metadata block),
+    /// cosmic-comp will:
+    /// 1. Set the connector's `Colorspace` property to `BT2020_RGB`
+    /// 2. Build and write an `HDR_OUTPUT_METADATA` blob (BT.2100 InfoFrame)
+    ///    derived from the panel's EDID-reported peak/min luminance
+    /// 3. Force `max_bpc >= 10` (HDR with 8-bit color is unwatchably banded)
+    ///
+    /// This signals the panel into HDR mode. SDR client content rendered in
+    /// this mode will look dim/washed until SDR-to-HDR tone mapping (Phase 2)
+    /// lands, but the panel itself will be in genuine HDR pipeline.
+    ///
+    /// Defaults to disabled (`None` → SDR Rec.709, identical to upstream).
+    /// Only set on connectors known to be HDR-capable; the apply path bails
+    /// safely on connectors that don't advertise the required properties.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hdr_enabled: Option<bool>,
 }
 
 impl Default for OutputConfig {
@@ -64,6 +82,7 @@ impl Default for OutputConfig {
             enabled: OutputState::Enabled,
             max_bpc: None,
             xwayland_primary: false,
+            hdr_enabled: None,
         }
     }
 }
