@@ -712,6 +712,15 @@ impl DynamicConfig {
         PersistenceGuard(self.outputs.0.clone(), &mut self.outputs.1)
     }
 
+    /// Re-read outputs.ron from disk, replacing the in-memory cache.
+    /// Caller is responsible for invoking the apply path afterwards
+    /// (e.g. `State::refresh_output_config`). Used by the SIGUSR1
+    /// hot-reload path so HDR tuner / other tools can poke their
+    /// changes through without a full session relogin.
+    pub fn reload_outputs_from_disk(&mut self) {
+        self.outputs.1 = load_outputs(self.outputs.0.as_ref());
+    }
+
     pub fn numlock(&self) -> &NumlockStateConfig {
         &self.numlock.1
     }

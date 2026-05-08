@@ -357,9 +357,22 @@ struct HdrOutputMetadata {
 /// EOTF: SMPTE ST 2084 (PQ) — the modern HDR standard used by HDR10 etc.
 const EOTF_PQ: u8 = 2;
 
-// BT.2020 / BT.2100 mastering display primaries in 0.00002 chromaticity units
+// DCI-P3 D65 mastering display primaries in 0.00002 chromaticity units
 // (50000 = 1.0). Layout: r_x, r_y, g_x, g_y, b_x, b_y — interleaved per the
 // kernel's `display_primaries[3]` struct array.
+//
+// NOTE: signaling DCI-P3 (not BT.2020) because the actual panel hardware on
+// Jake's laptop is a P3-gamut Tandem OLED. Tagging BT.2020 caused the panel
+// to map values from BT.2020 → its native P3 hardware, crushing saturated
+// colors as a side effect. Tagging DCI-P3 lets the panel decode directly
+// without an extra gamut compression step. The kernel `Colorspace` property
+// is set to `DCI-P3_RGB_D65` to match.
+const DCI_P3_PRIMARIES: [u16; 6] = [
+    34000, 16000, // R: 0.680, 0.320
+    13250, 34500, // G: 0.265, 0.690
+    7500, 3000, // B: 0.150, 0.060
+];
+// BT.2020 (ITU-R Rec.2020) primaries, same 0.00002 chroma units.
 const BT2020_PRIMARIES: [u16; 6] = [
     35400, 14600, // R: 0.708, 0.292
     8500, 39850, // G: 0.170, 0.797
@@ -367,6 +380,33 @@ const BT2020_PRIMARIES: [u16; 6] = [
 ];
 // D65 reference white in same units, [x, y].
 const D65_WHITE: [u16; 2] = [15635, 16450]; // 0.3127, 0.3290
+
+/// Which wide-gamut container we're tagging the InfoFrame as. Drives both
+/// `display_primaries` in the metadata blob and the `Colorspace` enum
+/// variant we set on the connector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HdrColorContainer {
+    Bt2020,
+    DciP3,
+}
+
+impl HdrColorContainer {
+    /// `Colorspace` enum-property variant name for this container.
+    pub fn colorspace_variant(self) -> &'static str {
+        match self {
+            HdrColorContainer::Bt2020 => "BT2020_RGB",
+            HdrColorContainer::DciP3 => "DCI-P3_RGB_D65",
+        }
+    }
+
+    /// Display primaries (interleaved [r_x, r_y, g_x, g_y, b_x, b_y]).
+    pub fn primaries(self) -> [u16; 6] {
+        match self {
+            HdrColorContainer::Bt2020 => BT2020_PRIMARIES,
+            HdrColorContainer::DciP3 => DCI_P3_PRIMARIES,
+        }
+    }
+}
 
 /// Per-output mastering luminance bounds, in the units the kernel expects.
 /// Derived from the panel's EDID HDR static metadata block (Phase 1.5);
@@ -400,12 +440,15 @@ impl HdrMasteringLuminance {
 /// Build the raw bytes of an HDR_OUTPUT_METADATA blob describing PQ-encoded
 /// HDR content with BT.2020 primaries and D65 white, mastered to the given
 /// luminance bounds. Resulting buffer goes into `Device::create_property_blob`.
-fn build_hdr_metadata_blob(lum: HdrMasteringLuminance) -> Vec<u8> {
+fn build_hdr_metadata_blob(
+    lum: HdrMasteringLuminance,
+    container: HdrColorContainer,
+) -> Vec<u8> {
     let m = HdrOutputMetadata {
         metadata_type: 0, // HDR_OUTPUT_METADATA_TYPE1
         eotf: EOTF_PQ,
         static_metadata_type: 0,
-        display_primaries: BT2020_PRIMARIES,
+        display_primaries: container.primaries(),
         white_point: D65_WHITE,
         max_display_mastering_luminance: lum.max_lum_nits,
         min_display_mastering_luminance: lum.min_lum_units,
@@ -446,12 +489,15 @@ pub fn colorspace_enum_value(
 }
 
 /// Returns true if the connector advertises the property surface required to
-/// drive HDR signaling (BT2020_RGB Colorspace variant + HDR_OUTPUT_METADATA).
+/// drive HDR signaling. We probe for `DCI-P3_RGB_D65` (the colorspace we
+/// actually use for the Tandem OLED panels in scope here) — most HDR-capable
+/// connectors expose this enum variant alongside BT2020_RGB.
 pub fn connector_supports_hdr(dev: &impl ControlDevice, conn: connector::Handle) -> bool {
     if get_prop(dev, conn, "HDR_OUTPUT_METADATA").is_err() {
         return false;
     }
-    colorspace_enum_value(dev, conn, "BT2020_RGB").is_ok()
+    colorspace_enum_value(dev, conn, "DCI-P3_RGB_D65").is_ok()
+        || colorspace_enum_value(dev, conn, "BT2020_RGB").is_ok()
 }
 
 /// Build an `HDR_OUTPUT_METADATA` blob (PQ + BT.2020 + supplied luminance) and
@@ -463,8 +509,9 @@ pub fn connector_supports_hdr(dev: &impl ControlDevice, conn: connector::Handle)
 pub fn create_hdr_metadata_blob(
     dev: &impl ControlDevice,
     lum: HdrMasteringLuminance,
+    container: HdrColorContainer,
 ) -> Result<u64> {
-    let bytes = build_hdr_metadata_blob(lum);
+    let bytes = build_hdr_metadata_blob(lum, container);
     let blob = dev
         .create_property_blob(&bytes)
         .context("create HDR_OUTPUT_METADATA blob")?;

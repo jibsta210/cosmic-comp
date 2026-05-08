@@ -146,6 +146,19 @@ pub struct SurfaceThreadState {
     output: Output,
     mirroring: Option<Output>,
     screen_filter: ScreenFilter,
+    /// HDR signaling state — driven by `output_config.hdr_enabled`. When true,
+    /// the surface uses the offscreen postprocess pipeline with the PQ-encode
+    /// path (color_mode=5.0) and forces the swapchain to a 10-bit FB format.
+    /// See `src/backend/render/shaders/offscreen.frag` for the encode math
+    /// and `src/backend/kms/mod.rs` for where this gets toggled.
+    hdr_enabled: bool,
+    /// Live-tunable HDR shader knobs. Pushed in via `UpdateHdrConfig`. Defaults
+    /// match BT.2408 / standards-compliant playback so out-of-the-box HDR is
+    /// reasonable; the hdr-tuner GUI overrides these for live experimentation.
+    hdr_colorspace_for_shader: f32, // 0.0 = BT.2020, 1.0 = DCI-P3
+    hdr_ref_white: f32,             // cd/m^2
+    hdr_gamut_mix: f32,             // 0.0..=1.0
+    hdr_test_pattern: bool,
     postprocess_textures: HashMap<DrmNode, PostprocessState>,
 
     shell: Arc<parking_lot::RwLock<Shell>>,
@@ -214,6 +227,13 @@ pub enum ThreadCommand {
     },
     UpdateMirroring(Option<Output>),
     UpdateScreenFilter(ScreenFilter),
+    UpdateHdrEnabled(bool),
+    UpdateHdrTuning {
+        colorspace_for_shader: f32,
+        ref_white: f32,
+        gamut_mix: f32,
+        test_pattern: bool,
+    },
     VBlank(Option<DrmEventMetadata>),
     ScheduleRender,
     AdaptiveSyncAvailable(SyncSender<Result<VrrSupport>>),
@@ -404,6 +424,41 @@ impl Surface {
             .send(ThreadCommand::UpdateScreenFilter(config));
     }
 
+    /// Toggle HDR PQ post-process for this surface. When `true` the surface
+    /// runs the offscreen postprocess pipeline with `color_mode=5.0` (PQ
+    /// encode) regardless of `screen_filter` state, so output is BT.2020/PQ
+    /// for the panel that's been signaled into HDR mode.
+    pub fn set_hdr_enabled(&mut self, enabled: bool) {
+        warn!("[HDR] Surface::set_hdr_enabled({enabled}) -> dispatching ThreadCommand");
+        let send_result = self
+            .thread_command
+            .send(ThreadCommand::UpdateHdrEnabled(enabled));
+        if let Err(err) = send_result {
+            warn!(
+                ?err,
+                "[HDR] Surface::set_hdr_enabled — thread_command channel send failed"
+            );
+        }
+    }
+
+    /// Push live HDR shader tuning to the surface's render thread. Cheap —
+    /// just stores values that the next frame's `postprocess_elements` will
+    /// pass as GLES uniforms. Driven by the hdr-tuner GUI watcher.
+    pub fn set_hdr_tuning(
+        &mut self,
+        colorspace_for_shader: f32,
+        ref_white: f32,
+        gamut_mix: f32,
+        test_pattern: bool,
+    ) {
+        let _ = self.thread_command.send(ThreadCommand::UpdateHdrTuning {
+            colorspace_for_shader,
+            ref_white,
+            gamut_mix,
+            test_pattern,
+        });
+    }
+
     pub fn adaptive_sync_support(&self) -> Result<VrrSupport> {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let _ = self
@@ -545,6 +600,13 @@ fn surface_thread(
         output,
         mirroring: None,
         screen_filter,
+        hdr_enabled: false,
+        hdr_colorspace_for_shader: 0.0, // BT.2020 default
+        hdr_ref_white: 500.0,           // bumped from 203 (BT.2408) so the uniform-bind-failed
+                                        // fallback path lands on a usable brightness instead
+                                        // of dim-cinema reference. 500 ≈ panel peak.
+        hdr_gamut_mix: 1.0,             // full conversion default — partial mix is "washed out"
+        hdr_test_pattern: false,
         postprocess_textures: HashMap::new(),
 
         shell,
@@ -599,6 +661,29 @@ fn surface_thread(
             }
             Event::Msg(ThreadCommand::UpdateScreenFilter(filter_config)) => {
                 state.update_screen_filter(filter_config);
+            }
+            Event::Msg(ThreadCommand::UpdateHdrEnabled(enabled)) => {
+                warn!(
+                    "[HDR] thread received UpdateHdrEnabled({enabled}) — was {} now {}",
+                    state.hdr_enabled, enabled
+                );
+                state.hdr_enabled = enabled;
+            }
+            Event::Msg(ThreadCommand::UpdateHdrTuning {
+                colorspace_for_shader,
+                ref_white,
+                gamut_mix,
+                test_pattern,
+            }) => {
+                warn!(
+                    "[HDR] surface thread received UpdateHdrTuning: cs={:.1} ref_w={:.1} mix={:.2} test={}",
+                    colorspace_for_shader, ref_white, gamut_mix, test_pattern
+                );
+                state.hdr_colorspace_for_shader = colorspace_for_shader;
+                state.hdr_ref_white = ref_white;
+                state.hdr_gamut_mix = gamut_mix;
+                state.hdr_test_pattern = test_pattern;
+                state.queue_redraw(false);
             }
             Event::Msg(ThreadCommand::AdaptiveSyncAvailable(result)) => {
                 if let Some(compositor) = state.compositor.as_mut() {
@@ -1086,14 +1171,34 @@ impl SurfaceThreadState {
         };
 
         // actual rendering
+        // We force the offscreen postprocess pipeline whenever HDR is enabled
+        // (in addition to screen-filter / mirroring cases), so the PQ encode
+        // shader (color_mode=5.0) runs before scanout.
+        let needs_offscreen = !self.screen_filter.is_noop() || self.hdr_enabled;
+        // Log transitions only (once per state change) — helps confirm whether
+        // self.hdr_enabled is actually `true` here when output_config says so.
+        {
+            use std::sync::atomic::{AtomicU8, Ordering};
+            static LAST_STATE: AtomicU8 = AtomicU8::new(0xFF);
+            let bits = (self.hdr_enabled as u8) | ((needs_offscreen as u8) << 1)
+                | ((!self.screen_filter.is_noop() as u8) << 2);
+            if LAST_STATE.swap(bits, Ordering::Relaxed) != bits {
+                warn!(
+                    hdr_enabled = self.hdr_enabled,
+                    screen_filter_active = !self.screen_filter.is_noop(),
+                    needs_offscreen,
+                    "[HDR] render-loop state transition"
+                );
+            }
+        }
         let source_output = self
             .mirroring
             .as_ref()
-            .or((!self.screen_filter.is_noop()).then_some(&self.output))
+            .or(needs_offscreen.then_some(&self.output))
             .filter(|output| {
                 PostprocessOutputConfig::for_output_untransformed(output)
                     != PostprocessOutputConfig::for_output(&self.output)
-                    || !self.screen_filter.is_noop()
+                    || needs_offscreen
             });
 
         let mut pre_postprocess_data = PrePostprocessData::default();
@@ -1270,6 +1375,11 @@ impl SurfaceThreadState {
                 &pre_postprocess_data,
                 postprocess_state,
                 &self.screen_filter,
+                self.hdr_enabled,
+                self.hdr_colorspace_for_shader,
+                self.hdr_ref_white,
+                self.hdr_gamut_mix,
+                self.hdr_test_pattern,
             );
 
             if let Err(err) = compositor.with_compositor(|c| c.use_vrr(vrr)) {
@@ -1371,6 +1481,29 @@ impl SurfaceThreadState {
                                 self.send_frame_callbacks();
                             }
                         } else {
+                            // Atomic commit failed — kernel rejected the new state
+                            // (most often: HDR connector props + framebuffer-format
+                            // combination it doesn't accept, or VRR feature mismatch).
+                            //
+                            // Critical: still dispatch frame callbacks even on
+                            // commit failure. Wayland clients block their next
+                            // submit waiting for the previous frame's "presented"
+                            // signal; if commits keep failing and we never fire
+                            // callbacks, every non-overlay client (i.e. everything
+                            // except direct-scanout apps like Firefox) freezes
+                            // permanently. We rely on the queued estimated vblank
+                            // below as the primary callback path, but in case
+                            // that timer never fires (timer races, callbacks
+                            // gated downstream), also dispatch synchronously here
+                            // as a backstop so apps can keep submitting frames
+                            // — they might display sometimes, that's fine, the
+                            // alternative is everything looking frozen.
+                            if self.mirroring.is_none() {
+                                self.frame_callback_seq =
+                                    self.frame_callback_seq.wrapping_add(1);
+                                self.send_frame_callbacks();
+                            }
+
                             // we don't expect a vblank
                             let _ = self.vblank_frame.take();
 
@@ -1865,7 +1998,50 @@ fn postprocess_elements<'a>(
     pre_postprocess_data: &PrePostprocessData,
     postprocess_state: &PostprocessState,
     screen_filter: &ScreenFilter,
+    hdr_enabled: bool,
+    hdr_colorspace_for_shader: f32,
+    hdr_ref_white: f32,
+    hdr_gamut_mix: f32,
+    hdr_test_pattern: bool,
 ) -> Vec<CosmicElement<GlMultiRenderer<'a>>> {
+    // HDR PQ encode (color_mode=5.0) takes precedence over screen-filter
+    // color modes — they're effects on top of SDR sRGB content; once we've
+    // committed to outputting a BT.2020 PQ-encoded framebuffer, applying a
+    // greyscale or daltonization matrix in sRGB space and *then* encoding to
+    // PQ would still produce the right result, but then we'd need TWO color
+    // modes active. Phase 1 keeps it simple: HDR alone, no compositing of
+    // accessibility filters with HDR yet.
+    let color_mode_value: f32 = if hdr_enabled {
+        if hdr_test_pattern { 6.0 } else { 5.0 }
+    } else {
+        screen_filter
+            .color_filter
+            .map(|val| val as u8 as f32)
+            .unwrap_or(0.)
+    };
+    // Log color_mode transitions only — once per change rather than per frame —
+    // so we can confirm in journal whether the PQ shader is actually engaging.
+    {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static LAST_LOGGED: AtomicU32 = AtomicU32::new(u32::MAX);
+        // Hash inputs into u32 so we log only on change (color_mode + ref_white + mix + cs).
+        let key: u32 = ((color_mode_value * 10.0) as u32)
+            ^ ((hdr_ref_white as u32).wrapping_mul(7919))
+            ^ ((hdr_gamut_mix * 1000.0) as u32).wrapping_mul(31)
+            ^ ((hdr_colorspace_for_shader * 10.0) as u32).wrapping_mul(127)
+            ^ ((hdr_test_pattern as u32).wrapping_mul(2003));
+        if LAST_LOGGED.swap(key, Ordering::Relaxed) != key {
+            warn!(
+                "[HDR] postprocess_elements building element list: color_mode={:.1} hdr_enabled={} cs={:.1} ref_w={:.1} mix={:.2} test={}",
+                color_mode_value,
+                hdr_enabled,
+                hdr_colorspace_for_shader,
+                hdr_ref_white,
+                hdr_gamut_mix,
+                hdr_test_pattern,
+            );
+        }
+    }
     let postprocess_texture_shader = Borrow::<GlesRenderer>::borrow(renderer.as_ref())
         .egl_context()
         .user_data()
@@ -1898,13 +2074,10 @@ fn postprocess_elements<'a>(
             postprocess_texture_shader.0.clone(),
             vec![
                 Uniform::new("invert", if screen_filter.inverted { 1. } else { 0. }),
-                Uniform::new(
-                    "color_mode",
-                    screen_filter
-                        .color_filter
-                        .map(|val| val as u8 as f32)
-                        .unwrap_or(0.),
-                ),
+                Uniform::new("color_mode", color_mode_value),
+                Uniform::new("hdr_colorspace", hdr_colorspace_for_shader),
+                Uniform::new("hdr_ref_white", hdr_ref_white),
+                Uniform::new("hdr_gamut_mix", hdr_gamut_mix),
             ],
         ));
     }
@@ -1932,13 +2105,7 @@ fn postprocess_elements<'a>(
         postprocess_texture_shader.0.clone(),
         vec![
             Uniform::new("invert", if screen_filter.inverted { 1. } else { 0. }),
-            Uniform::new(
-                "color_mode",
-                screen_filter
-                    .color_filter
-                    .map(|val| val as u8 as f32)
-                    .unwrap_or(0.),
-            ),
+            Uniform::new("color_mode", color_mode_value),
         ],
     ));
 

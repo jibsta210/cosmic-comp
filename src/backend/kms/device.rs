@@ -94,7 +94,6 @@ pub struct Device {
     pub drm: GbmDrmOutputManager,
 
     supports_atomic: bool,
-    pub texture_formats: FormatSet,
     event_token: Option<RegistrationToken>,
     pub socket: Option<Socket>,
 }
@@ -114,6 +113,10 @@ pub struct InnerDevice {
     pub outputs: HashMap<connector::Handle, Output>,
     pub surfaces: HashMap<crtc::Handle, Surface>,
     pub gbm: GbmDevice<DrmDeviceFd>,
+    /// Renderer-supported (fourcc, modifier) pairs, used to look up valid
+    /// modifier lists when switching the swapchain format at runtime
+    /// (e.g. on HDR enable/disable, where we toggle Abgr2101010 ↔ Argb8888).
+    pub texture_formats: FormatSet,
 
     pub leased_connectors: Vec<(connector::Handle, crtc::Handle)>,
     pub leasing_global: Option<DrmLeaseState>,
@@ -341,6 +344,7 @@ impl State {
                 outputs: HashMap::new(),
                 surfaces: HashMap::new(),
                 gbm,
+                texture_formats,
 
                 leased_connectors: Vec::new(),
                 leasing_global,
@@ -349,7 +353,6 @@ impl State {
             },
 
             supports_atomic,
-            texture_formats,
             event_token: Some(token),
             socket,
         };

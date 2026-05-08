@@ -32,6 +32,26 @@ fn default_sync() -> AdaptiveSync {
     AdaptiveSync::Enabled
 }
 
+/// Wide-gamut colorspace tag the compositor signals to the panel via the
+/// connector `Colorspace` property and `HDR_OUTPUT_METADATA` primaries.
+/// The shader-side gamut matrix (Rec.709 → target) is selected to match.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum HdrColorspace {
+    /// BT.2020 — broadest container, the ITU-R HDR standard. Panel firmware
+    /// remaps internally to its native gamut. Most "compatible" choice.
+    Bt2020,
+    /// DCI-P3 D65 — closer to the Tandem OLED native gamut. Avoids one round
+    /// of internal mapping at the cost of being a less-universal tag.
+    DciP3,
+}
+
+impl Default for HdrColorspace {
+    fn default() -> Self {
+        HdrColorspace::Bt2020
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct OutputsConfig {
     pub config: HashMap<Vec<OutputInfo>, Vec<OutputConfig>>,
@@ -69,6 +89,25 @@ pub struct OutputConfig {
     /// safely on connectors that don't advertise the required properties.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hdr_enabled: Option<bool>,
+    /// Wide-gamut tag. `None` defaults to BT.2020 (standards-compliant).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hdr_colorspace: Option<HdrColorspace>,
+    /// SDR reference-white luminance in cd/m^2 (nits). BT.2408 says 203 for
+    /// graded content; raised for desktop content on bright OLEDs (~300).
+    /// Range we'll surface in UI: 80–500.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hdr_reference_white: Option<u32>,
+    /// Strength of the Rec.709 → target-gamut matrix in the shader,
+    /// expressed as a percentage 0..=100. 0 = pass sRGB primaries through
+    /// unchanged (trust panel firmware to remap). 100 = full conversion.
+    /// Useful for exploring "washed out" failure modes by mixing the two.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hdr_gamut_strength: Option<u8>,
+    /// When true, HDR output replaces normal content with a calibration
+    /// test pattern (`color_mode=6.0` in the offscreen shader). Quadrants
+    /// at known nits values + saturated primaries for eyeballing math.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hdr_test_pattern: Option<bool>,
 }
 
 impl Default for OutputConfig {
@@ -83,6 +122,10 @@ impl Default for OutputConfig {
             max_bpc: None,
             xwayland_primary: false,
             hdr_enabled: None,
+            hdr_colorspace: None,
+            hdr_reference_white: None,
+            hdr_gamut_strength: None,
+            hdr_test_pattern: None,
         }
     }
 }

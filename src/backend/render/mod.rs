@@ -414,6 +414,14 @@ pub fn init_shaders(renderer: &mut GlesRenderer) -> Result<(), GlesError> {
         &[
             UniformName::new("invert", UniformType::_1f),
             UniformName::new("color_mode", UniformType::_1f),
+            // HDR tuning uniforms — must be declared at compile time so smithay
+            // looks them up and binds them. Without these entries, Uniform::new()
+            // calls at frame-render time silently no-op and the shader sees 0.0
+            // for all three (visible symptom: extremely dim HDR output, sliders
+            // appear to do nothing). See offscreen.frag for what each controls.
+            UniformName::new("hdr_colorspace", UniformType::_1f),
+            UniformName::new("hdr_ref_white", UniformType::_1f),
+            UniformName::new("hdr_gamut_mix", UniformType::_1f),
         ],
     )?;
     let clipping_shader = renderer.compile_custom_texture_shader(

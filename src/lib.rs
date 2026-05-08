@@ -177,8 +177,38 @@ pub fn run(hooks: crate::hooks::Hooks) -> Result<(), Box<dyn Error>> {
         warn!(?err, "Failed to watch theme");
     }
 
+    // SIGUSR1 = "HDR tuning changed in outputs.ron, push it to surfaces".
+    // SURGICAL path — re-reads the file, then walks each KMS surface and pushes
+    // only the HDR shader uniforms via Surface::set_hdr_tuning. Skips the full
+    // refresh_output_config apply (which re-runs modes / scales / surface init
+    // and feels like a relogin). Used by cosmic-hdr-tuner.
+    //
+    // We use signal_hook::flag (atomic bool flipped from inside the signal
+    // handler) rather than calloop's signalfd because cosmic-comp spawns
+    // surface threads BEFORE we'd register the source — those threads don't
+    // inherit the signal mask, so signalfd sees nothing while the kernel
+    // delivers SIGUSR1 to a worker thread (where it's silently swallowed by
+    // smithay/wgpu). The atomic-flag pattern works regardless of which thread
+    // the kernel picks. We poll the flag once per event-loop iteration below.
+    let hdr_reload_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if let Err(err) = signal_hook::flag::register(
+        signal_hook::consts::SIGUSR1,
+        std::sync::Arc::clone(&hdr_reload_flag),
+    ) {
+        warn!(?err, "Failed to register SIGUSR1 handler for HDR live-reload");
+    } else {
+        warn!("[HDR] SIGUSR1 hot-reload registered (cosmic-hdr-tuner)");
+    }
+
     // run the event loop
     event_loop.run(None, &mut state, |state| {
+        // HDR live-reload: pick up sliders saved by cosmic-hdr-tuner.
+        if hdr_reload_flag.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            warn!("[HDR] SIGUSR1 received — reloading outputs.ron + pushing HDR tuning");
+            state.common.config.dynamic_conf.reload_outputs_from_disk();
+            push_hdr_tuning_to_surfaces(state);
+        }
+
         // shall we shut down?
         if state.common.should_stop {
             info!("Shutting down");
@@ -244,6 +274,86 @@ pub fn run(hooks: crate::hooks::Hooks) -> Result<(), Box<dyn Error>> {
     std::mem::drop(state);
 
     Ok(())
+}
+
+/// Surgical SIGUSR1 path: read the freshly-loaded outputs.ron from
+/// `state.common.config.dynamic_conf`, walk every KMS surface, and push the
+/// new HDR tuning values to its render thread. Also updates the per-Output
+/// cached `OutputConfig` so future reads see the new HDR fields. Does NOT
+/// re-run modes / scales / surface init — that's the heavy `refresh_output_config`
+/// path which feels like a relogin.
+fn push_hdr_tuning_to_surfaces(state: &mut state::State) {
+    use crate::state::BackendData;
+    use crate::utils::prelude::OutputExt;
+
+    // Snapshot the outputs config first (immutable borrow), so we can release
+    // it before calling mutable methods on the backend.
+    let snapshot: Vec<(String, cosmic_comp_config::output::comp::OutputConfig)> = {
+        let outputs = state.common.config.dynamic_conf.outputs();
+        let mut v = Vec::new();
+        for (infos, configs) in outputs.config.iter() {
+            for (info, cfg) in infos.iter().zip(configs.iter()) {
+                v.push((info.connector.clone(), cfg.clone()));
+            }
+        }
+        v
+    };
+
+    let kms = match &mut state.backend {
+        BackendData::Kms(k) => k,
+        _ => {
+            warn!("[HDR] SIGUSR1 received but backend is not KMS — ignored");
+            return;
+        }
+    };
+
+    let mut pushed = 0usize;
+    for device in kms.drm_devices.values_mut() {
+        for surface in device.inner.surfaces.values_mut() {
+            let connector_name = surface.output.name();
+            let Some(cfg) = snapshot
+                .iter()
+                .find(|(c, _)| *c == connector_name)
+                .map(|(_, c)| c.clone())
+            else {
+                continue;
+            };
+
+            // Update the per-Output cached config so other code sees the new
+            // HDR fields without going through the full apply path.
+            {
+                let mut out_cfg = surface.output.config_mut();
+                out_cfg.hdr_enabled = cfg.hdr_enabled;
+                out_cfg.hdr_colorspace = cfg.hdr_colorspace;
+                out_cfg.hdr_reference_white = cfg.hdr_reference_white;
+                out_cfg.hdr_gamut_strength = cfg.hdr_gamut_strength;
+                out_cfg.hdr_test_pattern = cfg.hdr_test_pattern;
+            }
+
+            // Push to surface render thread.
+            let hdr_on = cfg.hdr_enabled.unwrap_or(false);
+            surface.set_hdr_enabled(hdr_on);
+            if hdr_on {
+                let cs_for_shader = match cfg.hdr_colorspace {
+                    Some(cosmic_comp_config::output::comp::HdrColorspace::DciP3) => 1.0,
+                    _ => 0.0,
+                };
+                let ref_white = cfg.hdr_reference_white.map(|n| n as f32).unwrap_or(500.0);
+                let gamut_mix = cfg.hdr_gamut_strength.map(|p| (p as f32) / 100.0).unwrap_or(1.0);
+                let test_pattern = cfg.hdr_test_pattern.unwrap_or(false);
+                warn!(
+                    "[HDR] surgical push to {}: cs={:.1} ref_w={:.1} mix={:.2} test={}",
+                    connector_name, cs_for_shader, ref_white, gamut_mix, test_pattern
+                );
+                surface.set_hdr_tuning(cs_for_shader, ref_white, gamut_mix, test_pattern);
+            }
+            pushed += 1;
+        }
+    }
+
+    if pushed == 0 {
+        warn!("[HDR] SIGUSR1 surgical reload: no surfaces matched any outputs.ron entry");
+    }
 }
 
 fn print_help(version: &str, git_rev: &str) {
