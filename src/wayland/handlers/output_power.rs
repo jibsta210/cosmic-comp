@@ -22,6 +22,22 @@ pub fn set_all_surfaces_dpms_on(state: &mut State) {
 
     if changed {
         OutputPowerState::refresh(state);
+        // After waking from DPMS off, re-apply output config so the HDR
+        // state (CRTC color pipeline blobs: DEGAMMA_LUT + CTM + GAMMA_LUT,
+        // plus connector Colorspace + HDR_OUTPUT_METADATA) gets re-staged.
+        // The kernel can drop CRTC color-block references during the off
+        // period, and smithay's pending state might still reference blob
+        // IDs that are no longer live on the CRTC — leading to commits
+        // that reference stale blobs being rejected by atomic_check, which
+        // manifested as a "screen stays black after timeout, can't recover"
+        // bug. Re-running refresh_output_config takes the apply path
+        // through the HDR-enable code, which creates fresh blobs and
+        // pushes them via smithay set_hdr_state. SDR-only setups pay a
+        // cheap config-reread; HDR setups get their hardware color
+        // pipeline back online cleanly.
+        if let Err(err) = state.refresh_output_config() {
+            tracing::warn!(?err, "[HDR] Failed to refresh output config on DPMS resume");
+        }
     }
 }
 
