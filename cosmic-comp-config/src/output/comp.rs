@@ -103,6 +103,21 @@ pub struct OutputConfig {
     /// Useful for exploring "washed out" failure modes by mixing the two.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hdr_gamut_strength: Option<u8>,
+    /// Luminance-preserving saturation boost applied after the gamut matrix
+    /// in the HDR shader, expressed as a percentage 50..=200 (100 = neutral
+    /// / colorimetrically truthful, >100 = more vivid, <100 = more washed).
+    /// Compensates for loss of vendor-applied SDR vibrance enhancements when
+    /// switching to colorimetrically-strict HDR mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hdr_saturation: Option<u8>,
+    /// Midtone gamma applied in luminance space before PQ encode, as
+    /// percentage 30..=150 (100 = neutral, <100 lifts midtones into HDR
+    /// range, equivalent to Windows' AutoHDR brightness-lift). 70 ≈ default
+    /// soft lift, 50 = aggressive. Solves the "SDR pixels look dim in HDR"
+    /// problem by mapping cosmic UI midtones from ~50 nits to ~150-200 nits
+    /// without desaturating (chroma-preserving via Y/Y_orig scaling).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hdr_midtone_gamma: Option<u8>,
     /// When true, HDR output replaces normal content with a calibration
     /// test pattern (`color_mode=6.0` in the offscreen shader). Quadrants
     /// at known nits values + saturated primaries for eyeballing math.
@@ -125,6 +140,8 @@ impl Default for OutputConfig {
             hdr_colorspace: None,
             hdr_reference_white: None,
             hdr_gamut_strength: None,
+            hdr_saturation: None,
+            hdr_midtone_gamma: None,
             hdr_test_pattern: None,
         }
     }

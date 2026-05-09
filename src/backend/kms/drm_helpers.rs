@@ -282,6 +282,81 @@ pub fn get_max_bpc(
     Ok(Some((value, range)))
 }
 
+/// Set the connector's `Broadcast RGB` enum property to **Full** (PC range,
+/// 0-255). Critical for HDR signaling on panels where the kernel default
+/// (`Automatic`) resolves to `Limited 16:235` (TV range), which compresses
+/// PC-range PQ-encoded content into 16-235 of the panel's 0-255 — visibly
+/// "washed out and lower contrast". Mutter sets this property unconditionally
+/// during its HDR path; we should too.
+///
+/// On this Dell XPS 16 Tandem OLED via xe driver, the panel's reported
+/// "Minimum SDR Luminance Full Coverage = 20 cd/m^2" is consistent with
+/// 16/255 of the panel's max — i.e. it's currently in Limited range.
+///
+/// Returns Ok(()) silently if the connector doesn't expose this property
+/// (some embedded panels don't). Errors only on a real DRM failure.
+pub fn set_broadcast_rgb_full(dev: &impl ControlDevice, conn: connector::Handle) -> Result<()> {
+    let prop_handle = match get_prop(dev, conn, "Broadcast RGB") {
+        Ok(h) => h,
+        Err(_) => return Ok(()), // property absent on this connector — no-op
+    };
+    let info = dev.get_property(prop_handle)?;
+    let variants = match info.value_type() {
+        property::ValueType::Enum(values) => values,
+        _ => return Err(anyhow!("Broadcast RGB has wrong value type")),
+    };
+    // Look for the "Full" variant explicitly (value=1 on Intel xe, but we
+    // resolve by name to be portable).
+    let full_value = variants
+        .values()
+        .1
+        .iter()
+        .find(|v| v.name().to_str().ok() == Some("Full"))
+        .map(|v| v.value())
+        .ok_or_else(|| anyhow!("Broadcast RGB enum has no `Full` variant"))?;
+    // set_property takes RawValue (u64). Enum prop values ARE u64 raw values
+    // — we can pass directly without going through `property::Value::Enum`
+    // (which borrows a `&'a EnumValue` and complicates lifetimes here).
+    dev.set_property(conn, prop_handle, full_value)
+        .map_err(Into::<anyhow::Error>::into)?;
+    Ok(())
+}
+
+/// Diagnostic / belt-and-braces: also set the `Colorspace` enum property via
+/// the legacy non-atomic `set_property` IOCTL. The atomic commit path SHOULD
+/// be carrying this through smithay's `set_hdr_state`, but on this xe + Tandem
+/// OLED combo modetest reads `Colorspace: value: 0 (Default)` after a successful
+/// HDR setup, which means panel is in SDR mode and PQ-encoded content gets
+/// interpreted as sRGB — exactly the washed-out symptom we're chasing. Writing
+/// the property here doubles up: if atomic commits the prop fine, this is a
+/// no-op; if atomic silently drops it, this puts the panel into the right
+/// signaling mode anyway.
+pub fn set_colorspace_legacy(
+    dev: &impl ControlDevice,
+    conn: connector::Handle,
+    variant_name: &str,
+) -> Result<()> {
+    let prop_handle = match get_prop(dev, conn, "Colorspace") {
+        Ok(h) => h,
+        Err(_) => return Ok(()),
+    };
+    let info = dev.get_property(prop_handle)?;
+    let variants = match info.value_type() {
+        property::ValueType::Enum(values) => values,
+        _ => return Err(anyhow!("Colorspace has wrong value type")),
+    };
+    let target_value = variants
+        .values()
+        .1
+        .iter()
+        .find(|v| v.name().to_str().ok() == Some(variant_name))
+        .map(|v| v.value())
+        .ok_or_else(|| anyhow!("Colorspace enum has no variant {variant_name:?}"))?;
+    dev.set_property(conn, prop_handle, target_value)
+        .map_err(Into::<anyhow::Error>::into)?;
+    Ok(())
+}
+
 pub fn set_max_bpc(dev: &impl ControlDevice, conn: connector::Handle, bpc: u32) -> Result<u32> {
     let (_, range) =
         get_max_bpc(dev, conn)?.ok_or(anyhow!("max bpc does not exist for connector"))?;
@@ -427,12 +502,39 @@ impl HdrMasteringLuminance {
     /// Conservative defaults for an HDR-capable OLED panel where the EDID
     /// block hasn't been parsed yet. Tuned for ~500 nit OLEDs (close to
     /// jake's panel; safe-ish for most laptop OLEDs).
+    ///
+    /// **Important distinction (CTA-861.3 / SMPTE 2086):**
+    /// - `max_lum_nits` / `min_lum_units` describe the **mastering display**
+    ///   used to grade the content (= the panel, since we're "mastering live").
+    /// - `max_cll_nits` describes the **content's peak pixel** — for SDR
+    ///   content scaled to ref_white, this should be ref_white (not panel max).
+    /// - `max_fall_nits` describes the **content's frame-average** — desktop
+    ///   content typically averages ~30% of peak.
+    ///
+    /// Telling the panel "content peaks at 500 nits" when our content actually
+    /// peaks at ref_white=200 makes the panel firmware tone-map for "bright
+    /// HDR content" — which on this Tandem OLED visibly suppresses the low-PQ
+    /// desktop pixels (= the "dull desktop" symptom). Mutter sets target_max_cll
+    /// dynamically per-output, matching content not panel.
     pub fn fallback_oled() -> Self {
         Self {
-            max_lum_nits: 500,
+            max_lum_nits: 525,
             min_lum_units: 5, // 0.0005 nits
-            max_cll_nits: 500,
-            max_fall_nits: 400,
+            max_cll_nits: 200,
+            max_fall_nits: 80,
+        }
+    }
+
+    /// Build content-aware metadata from the current SDR reference white. The
+    /// panel firmware uses these fields to drive its internal tone-mapping; if
+    /// they describe the actual content (rather than the panel) it can scale
+    /// our 0..ref_white range across more of its display volume.
+    pub fn for_sdr_content(ref_white_nits: u16) -> Self {
+        Self {
+            max_lum_nits: 525, // panel mastering capability
+            min_lum_units: 5,
+            max_cll_nits: ref_white_nits,
+            max_fall_nits: ref_white_nits.saturating_mul(2) / 5, // ~40% avg, conservative for desktop
         }
     }
 }

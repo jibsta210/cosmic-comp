@@ -158,6 +158,8 @@ pub struct SurfaceThreadState {
     hdr_colorspace_for_shader: f32, // 0.0 = BT.2020, 1.0 = DCI-P3
     hdr_ref_white: f32,             // cd/m^2
     hdr_gamut_mix: f32,             // 0.0..=1.0
+    hdr_saturation: f32,            // 1.0 = neutral, >1.0 = more vivid
+    hdr_midtone_gamma: f32,         // 1.0 = neutral, <1.0 lifts SDR midtones into HDR range
     hdr_test_pattern: bool,
     postprocess_textures: HashMap<DrmNode, PostprocessState>,
 
@@ -232,6 +234,8 @@ pub enum ThreadCommand {
         colorspace_for_shader: f32,
         ref_white: f32,
         gamut_mix: f32,
+        saturation: f32,
+        midtone_gamma: f32,
         test_pattern: bool,
     },
     VBlank(Option<DrmEventMetadata>),
@@ -449,12 +453,16 @@ impl Surface {
         colorspace_for_shader: f32,
         ref_white: f32,
         gamut_mix: f32,
+        saturation: f32,
+        midtone_gamma: f32,
         test_pattern: bool,
     ) {
         let _ = self.thread_command.send(ThreadCommand::UpdateHdrTuning {
             colorspace_for_shader,
             ref_white,
             gamut_mix,
+            saturation,
+            midtone_gamma,
             test_pattern,
         });
     }
@@ -602,10 +610,10 @@ fn surface_thread(
         screen_filter,
         hdr_enabled: false,
         hdr_colorspace_for_shader: 0.0, // BT.2020 default
-        hdr_ref_white: 500.0,           // bumped from 203 (BT.2408) so the uniform-bind-failed
-                                        // fallback path lands on a usable brightness instead
-                                        // of dim-cinema reference. 500 ≈ panel peak.
+        hdr_ref_white: 250.0,           // close to KWin / BT.2408 default of 200-203 nits
         hdr_gamut_mix: 1.0,             // full conversion default — partial mix is "washed out"
+        hdr_saturation: 1.2,            // mild vibrance boost to compensate for loss of vendor SDR enhancement
+        hdr_midtone_gamma: 0.7,         // lift SDR midtones into HDR luminance range (Windows AutoHDR-like)
         hdr_test_pattern: false,
         postprocess_textures: HashMap::new(),
 
@@ -673,15 +681,19 @@ fn surface_thread(
                 colorspace_for_shader,
                 ref_white,
                 gamut_mix,
+                saturation,
+                midtone_gamma,
                 test_pattern,
             }) => {
                 warn!(
-                    "[HDR] surface thread received UpdateHdrTuning: cs={:.1} ref_w={:.1} mix={:.2} test={}",
-                    colorspace_for_shader, ref_white, gamut_mix, test_pattern
+                    "[HDR] surface thread received UpdateHdrTuning: cs={:.1} ref_w={:.1} mix={:.2} sat={:.2} gamma={:.2} test={}",
+                    colorspace_for_shader, ref_white, gamut_mix, saturation, midtone_gamma, test_pattern
                 );
                 state.hdr_colorspace_for_shader = colorspace_for_shader;
                 state.hdr_ref_white = ref_white;
                 state.hdr_gamut_mix = gamut_mix;
+                state.hdr_saturation = saturation;
+                state.hdr_midtone_gamma = midtone_gamma;
                 state.hdr_test_pattern = test_pattern;
                 state.queue_redraw(false);
             }
@@ -1132,6 +1144,21 @@ impl SurfaceThreadState {
             remove_frame_flags |= FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT;
         }
 
+        // (Earlier this branch removed ALLOW_SCANOUT for HDR mode while we
+        //  were chasing a different bug — turned out the actual issue was
+        //  the main postprocess element being constructed with only 2
+        //  uniforms instead of 7 (see line ~2159). Now that all uniforms
+        //  reach the shader, direct scanout via primary plane bypasses the
+        //  shader so the panel sees raw sRGB content tagged as PQ — still
+        //  needs to be handled, but the proper fix is in smithay: make the
+        //  scanout-eligibility check shader-aware (TextureShaderElement
+        //  with custom shader = ineligible for direct scanout). Until that
+        //  smithay patch lands, this re-disables scanout when HDR is on.)
+        if self.hdr_enabled {
+            remove_frame_flags |= FrameFlags::ALLOW_SCANOUT;
+            remove_frame_flags |= FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT;
+        }
+
         let mut vrr = matches!(self.vrr_mode, AdaptiveSync::Force);
 
         if self.vrr_mode == AdaptiveSync::Enabled {
@@ -1379,11 +1406,33 @@ impl SurfaceThreadState {
                 self.hdr_colorspace_for_shader,
                 self.hdr_ref_white,
                 self.hdr_gamut_mix,
+                self.hdr_saturation,
+                self.hdr_midtone_gamma,
                 self.hdr_test_pattern,
             );
 
             if let Err(err) = compositor.with_compositor(|c| c.use_vrr(vrr)) {
                 warn!("Unable to set adaptive VRR state: {}", err);
+            }
+            // [HDR-FRAME-CALL] Log what we're handing to compositor.render_frame
+            // — element count + flags. Throttled 1/sec.
+            {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static LAST: AtomicU64 = AtomicU64::new(0);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                if LAST.load(Ordering::Relaxed) != now {
+                    let final_flags = self.frame_flags
+                        .union(additional_frame_flags)
+                        .difference(remove_frame_flags);
+                    warn!(
+                        "[HDR-FRAME-CALL] render_frame: hdr_enabled={} elements.len()={} flags={:?} (1/sec)",
+                        self.hdr_enabled, elements.len(), final_flags
+                    );
+                    LAST.store(now, Ordering::Relaxed);
+                }
             }
             compositor.render_frame(
                 &mut renderer,
@@ -2002,6 +2051,8 @@ fn postprocess_elements<'a>(
     hdr_colorspace_for_shader: f32,
     hdr_ref_white: f32,
     hdr_gamut_mix: f32,
+    hdr_saturation: f32,
+    hdr_midtone_gamma: f32,
     hdr_test_pattern: bool,
 ) -> Vec<CosmicElement<GlMultiRenderer<'a>>> {
     // HDR PQ encode (color_mode=5.0) takes precedence over screen-filter
@@ -2078,6 +2129,8 @@ fn postprocess_elements<'a>(
                 Uniform::new("hdr_colorspace", hdr_colorspace_for_shader),
                 Uniform::new("hdr_ref_white", hdr_ref_white),
                 Uniform::new("hdr_gamut_mix", hdr_gamut_mix),
+                Uniform::new("hdr_saturation", hdr_saturation),
+                Uniform::new("hdr_midtone_gamma", hdr_midtone_gamma),
             ],
         ));
     }
@@ -2106,6 +2159,11 @@ fn postprocess_elements<'a>(
         vec![
             Uniform::new("invert", if screen_filter.inverted { 1. } else { 0. }),
             Uniform::new("color_mode", color_mode_value),
+            Uniform::new("hdr_colorspace", hdr_colorspace_for_shader),
+            Uniform::new("hdr_ref_white", hdr_ref_white),
+            Uniform::new("hdr_gamut_mix", hdr_gamut_mix),
+            Uniform::new("hdr_saturation", hdr_saturation),
+            Uniform::new("hdr_midtone_gamma", hdr_midtone_gamma),
         ],
     ));
 

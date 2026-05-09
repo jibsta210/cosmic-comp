@@ -34,6 +34,20 @@ uniform float color_mode;
 uniform float hdr_colorspace;
 uniform float hdr_ref_white;
 uniform float hdr_gamut_mix;
+// Saturation boost applied in linear-light luminance space. 1.0 = neutral
+// (colorimetrically correct), >1.0 = more vivid, <1.0 = washed. Compensates
+// for the perceived loss of "punch" when going from vendor-saturated SDR
+// mode to colorimetrically-truthful HDR mode. Range typically 0.8 - 1.5.
+uniform float hdr_saturation;
+// Midtone gamma applied to LUMINANCE (Y) before saturation + PQ encoding.
+// Solves the "SDR content rendered in HDR mode looks dim/washed" problem
+// — desktop UI pixels have low absolute luminance after sRGB decode (mid-gray
+// linear ~0.21), so when scaled by ref_white/10000 they end up at ~50 nits
+// while the panel can do 525. A gamma < 1.0 lifts midtones into the HDR
+// luminance range without touching chroma (RGB scale uniformly by the new
+// Y / old Y ratio). 1.0 = neutral, 0.7 = soft lift, 0.5 = aggressive.
+// Equivalent to Windows AutoHDR's brightness-lift curve concept.
+uniform float hdr_midtone_gamma;
 
 void main() {
     vec4 color = texture2D(tex, v_coords);
@@ -175,13 +189,40 @@ void main() {
         }
         vec3 lin_target = mix(lin, lin_remap, clamp(hdr_gamut_mix, 0.0, 1.0));
 
-        // 3. Linear SDR 1.0 → hdr_ref_white cd/m², normalized to PQ's 10000-nit
+        // 3. Optional saturation boost in linear-light luminance space.
+        //    KWin and other reference HDR pipelines do NOT include a
+        //    saturation lift in their HDR encode path — they aim for
+        //    colorimetric truth. But on this Tandem OLED, SDR mode applies
+        //    vendor color enhancements that go away in HDR mode, making the
+        //    HDR desktop look "washed" in user perception even though it's
+        //    mathematically correct. A modest saturation boost (1.1 - 1.3)
+        //    closes the perceived gap. Implemented as luminance-preserving
+        //    `mix(vec3(Y), color, saturation)` so chroma scales but
+        //    luminance is preserved (BT.2020 luma weights for our target).
+        // 3a. Midtone gamma in LUMINANCE space — lifts dim SDR-derived pixels
+        //     into the HDR luminance range without desaturating. Default 1.0
+        //     = no lift (colorimetric). 0.6-0.8 makes desktop content look
+        //     "punchy HDR-like." The trick: compute Y, gamma-curve it, scale
+        //     RGB by the ratio so chroma is preserved.
+        float gamma = (hdr_midtone_gamma < 0.1) ? 1.0 : hdr_midtone_gamma;
+        float Y_orig = dot(lin_target, vec3(0.2627, 0.6780, 0.0593));
+        float Y_new = pow(max(Y_orig, 0.0), gamma);
+        float lift_scale = (Y_orig > 0.0001) ? (Y_new / Y_orig) : 1.0;
+        vec3 lin_lifted = lin_target * lift_scale;
+
+        // 3b. Saturation: same fallback logic as midtone. <0.5 means uniform
+        //     binding failed; use 1.0 (no boost) so we don't blow into pure
+        //     grayscale (mix at 0 would do that).
+        float sat = (hdr_saturation < 0.5) ? 1.0 : hdr_saturation;
+        float Y_lifted = dot(lin_lifted, vec3(0.2627, 0.6780, 0.0593));
+        vec3 lin_final = mix(vec3(Y_lifted), lin_lifted, sat);
+
+        // 4. Linear SDR 1.0 → hdr_ref_white cd/m², normalized to PQ's 10000-nit
         //    peak. (PQ encodes absolute luminance; 1.0 in == 10000 nits out.)
-        //    Floor at 500 nits — if the uniform fails to bind for any reason
-        //    we'd rather surface a too-bright-but-usable desktop than a
-        //    pitch-black one. ref_w = max(hdr_ref_white, 500.0).
-        float ref_w = max(hdr_ref_white, 500.0);
-        vec3 hdr_lin = lin_target * (ref_w / 10000.0);
+        //    Floor at 250 nits — if the uniform fails to bind for any reason
+        //    we'd rather surface a usable brightness instead of pitch black.
+        float ref_w = max(hdr_ref_white, 250.0);
+        vec3 hdr_lin = lin_final * (ref_w / 10000.0);
 
         // 4. Inverse PQ EOTF (ST 2084) — encode linear (nits/10000) to FB val.
         const float m1 = 0.1593017578125;     // 2610/16384
@@ -201,6 +242,7 @@ void main() {
 
     // re-multiply
     color.rgb *= color.a;
+
 
     gl_FragColor = color;
 }

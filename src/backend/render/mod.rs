@@ -422,6 +422,8 @@ pub fn init_shaders(renderer: &mut GlesRenderer) -> Result<(), GlesError> {
             UniformName::new("hdr_colorspace", UniformType::_1f),
             UniformName::new("hdr_ref_white", UniformType::_1f),
             UniformName::new("hdr_gamut_mix", UniformType::_1f),
+            UniformName::new("hdr_saturation", UniformType::_1f),
+            UniformName::new("hdr_midtone_gamma", UniformType::_1f),
         ],
     )?;
     let clipping_shader = renderer.compile_custom_texture_shader(

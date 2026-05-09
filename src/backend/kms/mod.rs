@@ -909,6 +909,8 @@ impl KmsGuard<'_> {
                 let hdr_colorspace_setting = output_config.0.hdr_colorspace;
                 let hdr_ref_white_setting = output_config.0.hdr_reference_white;
                 let hdr_gamut_strength_setting = output_config.0.hdr_gamut_strength;
+                let hdr_saturation_setting = output_config.0.hdr_saturation;
+                let hdr_midtone_gamma_setting = output_config.0.hdr_midtone_gamma;
                 let hdr_test_pattern_setting = output_config.0.hdr_test_pattern;
                 let vrr_setting = output_config.0.vrr;
                 let max_bpc_setting = output_config.0.max_bpc;
@@ -1125,12 +1127,65 @@ impl KmsGuard<'_> {
                                     surface.output.name()
                                 );
                             } else {
+                                // Translate the user's hdr_colorspace setting to the kernel
+                                // Colorspace enum variant + matching primaries in the metadata
+                                // blob. Default = BT.2020 (standards-compliant container).
+                                let container = match hdr_colorspace_setting {
+                                    Some(cosmic_comp_config::output::comp::HdrColorspace::DciP3) => {
+                                        drm_helpers::HdrColorContainer::DciP3
+                                    }
+                                    _ => drm_helpers::HdrColorContainer::Bt2020,
+                                };
                                 if let Err(err) = drm_helpers::set_max_bpc(drm.device(), conn, 10) {
                                     warn!(
                                         ?err,
                                         "[HDR] Failed to bump max_bpc to 10 for HDR on connector: {}",
                                         surface.output.name()
                                     );
+                                }
+                                // Force Broadcast RGB=Full so PC-range PQ values
+                                // aren't TV-range-remapped by the panel firmware.
+                                // Mutter does this unconditionally during its HDR
+                                // path; we were missing it. Symptom of being on
+                                // Limited (the kernel default for `Automatic`)
+                                // is a washed/low-contrast HDR image plus the
+                                // panel reporting "Min SDR luminance: 20 cd/m²"
+                                // (≈ 16/255 of the panel's max).
+                                match drm_helpers::set_broadcast_rgb_full(drm.device(), conn) {
+                                    Ok(()) => warn!(
+                                        "[HDR] forced Broadcast RGB=Full on {}",
+                                        surface.output.name()
+                                    ),
+                                    Err(err) => warn!(
+                                        ?err,
+                                        "[HDR] Failed to force Broadcast RGB=Full on {}",
+                                        surface.output.name()
+                                    ),
+                                }
+                                // Diagnostic / belt-and-braces: also write
+                                // Colorspace via legacy set_property. Atomic
+                                // path SHOULD carry this via smithay's
+                                // set_hdr_state, but modetest shows
+                                // Colorspace=Default(0) post-setup which would
+                                // silently leave panel in SDR mode and explain
+                                // the persistent washed-out symptom. Writing
+                                // here puts the panel into HDR signaling
+                                // independent of the atomic-commit code path.
+                                let cs_variant = container.colorspace_variant();
+                                match drm_helpers::set_colorspace_legacy(
+                                    drm.device(),
+                                    conn,
+                                    cs_variant,
+                                ) {
+                                    Ok(()) => warn!(
+                                        "[HDR] forced Colorspace={} via legacy set_property on {}",
+                                        cs_variant, surface.output.name()
+                                    ),
+                                    Err(err) => warn!(
+                                        ?err,
+                                        "[HDR] Failed to force Colorspace={} via legacy on {}",
+                                        cs_variant, surface.output.name()
+                                    ),
                                 }
                                 let abgr2101010_modifier_count = device
                                     .inner
@@ -1166,23 +1221,25 @@ impl KmsGuard<'_> {
                                         active_modifiers,
                                     );
                                 }
-                                // Translate the user's hdr_colorspace setting to the kernel
-                                // Colorspace enum variant + matching primaries in the metadata
-                                // blob. Default = BT.2020 (standards-compliant container).
-                                let container = match hdr_colorspace_setting {
-                                    Some(cosmic_comp_config::output::comp::HdrColorspace::DciP3) => {
-                                        drm_helpers::HdrColorContainer::DciP3
-                                    }
-                                    _ => drm_helpers::HdrColorContainer::Bt2020,
-                                };
                                 let setup_result = (|| -> anyhow::Result<smithay::backend::drm::HdrState> {
                                     let colorspace_value = drm_helpers::colorspace_enum_value(
                                         drm.device(),
                                         conn,
                                         container.colorspace_variant(),
                                     )?;
+                                    // Use panel-EDID-spec mastering values
+                                    // matching KWin's reference implementation
+                                    // (KDE Plasma 6 sources panel max_cll/fall
+                                    // from EDID, not from content). The earlier
+                                    // experiment with content-derived values
+                                    // didn't visibly help and diverges from
+                                    // upstream best practice.
                                     let lum =
                                         drm_helpers::HdrMasteringLuminance::fallback_oled();
+                                    warn!(
+                                        "[HDR] mastering metadata: max_lum={} max_cll={} max_fall={} (panel-EDID derived per KWin)",
+                                        lum.max_lum_nits, lum.max_cll_nits, lum.max_fall_nits
+                                    );
                                     let metadata_blob_id =
                                         drm_helpers::create_hdr_metadata_blob(
                                             drm.device(),
@@ -1237,20 +1294,28 @@ impl KmsGuard<'_> {
                                             };
                                         let ref_white = hdr_ref_white_setting
                                             .map(|n| n as f32)
-                                            .unwrap_or(500.0);
+                                            .unwrap_or(250.0);
                                         let gamut_mix = hdr_gamut_strength_setting
                                             .map(|p| (p as f32) / 100.0)
                                             .unwrap_or(1.0);
+                                        let saturation = hdr_saturation_setting
+                                            .map(|p| (p as f32) / 100.0)
+                                            .unwrap_or(1.2);
+                                        let midtone_gamma = hdr_midtone_gamma_setting
+                                            .map(|p| (p as f32) / 100.0)
+                                            .unwrap_or(0.7);
                                         let test_pattern =
                                             hdr_test_pattern_setting.unwrap_or(false);
                                         warn!(
-                                            "[HDR] pushing tuning to surface render thread: cs={:.1} ref_w={:.1} mix={:.2} test={}",
-                                            colorspace_for_shader, ref_white, gamut_mix, test_pattern
+                                            "[HDR] pushing tuning to surface render thread: cs={:.1} ref_w={:.1} mix={:.2} sat={:.2} gamma={:.2} test={}",
+                                            colorspace_for_shader, ref_white, gamut_mix, saturation, midtone_gamma, test_pattern
                                         );
                                         surface.set_hdr_tuning(
                                             colorspace_for_shader,
                                             ref_white,
                                             gamut_mix,
+                                            saturation,
+                                            midtone_gamma,
                                             test_pattern,
                                         );
                                     }

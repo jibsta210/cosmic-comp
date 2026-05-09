@@ -36,7 +36,7 @@ use std::{
     path::PathBuf,
     sync::{Arc, atomic::AtomicBool},
 };
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 mod input_config;
 pub mod key_bindings;
@@ -335,8 +335,31 @@ impl Config {
     }
 
     fn load_dynamic(xdg: &xdg::BaseDirectories) -> DynamicConfig {
-        let output_path = xdg.place_state_file("cosmic-comp/outputs.ron").ok();
+        // Session isolation: cosmic-comp-hdr (Lilypad fork) writes state to
+        // its own directory so vanilla cosmic-comp can't deserialize the file
+        // (its OutputConfig struct doesn't know about hdr_* fields, so any
+        // round-trip through vanilla DESTROYS the HDR state). On first run
+        // copy over vanilla's outputs.ron as a starting point so user doesn't
+        // lose their existing mode/scale/position config.
+        let hdr_output_path = xdg.place_state_file("cosmic-comp-hdr/outputs.ron").ok();
+        if let Some(ref hdr_path) = hdr_output_path
+            && !hdr_path.exists()
+            && let Ok(vanilla_path) = xdg.place_state_file("cosmic-comp/outputs.ron")
+            && vanilla_path.exists()
+        {
+            if let Err(err) = std::fs::copy(&vanilla_path, hdr_path) {
+                warn!(?err, "Failed to migrate vanilla outputs.ron to HDR path");
+            } else {
+                info!(
+                    "[HDR] migrated initial output config from {:?} to {:?}",
+                    vanilla_path, hdr_path
+                );
+            }
+        }
+        let output_path = hdr_output_path;
         let outputs = load_outputs(output_path.as_ref());
+        // Numlock + a11y filter still share with vanilla — they're vanilla
+        // schema, no HDR-specific fields, no risk of round-trip loss.
         let numlock_path = xdg.place_state_file("cosmic-comp/numlock.ron").ok();
         let numlock = Self::load_numlock(&numlock_path);
 

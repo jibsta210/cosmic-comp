@@ -327,6 +327,8 @@ fn push_hdr_tuning_to_surfaces(state: &mut state::State) {
                 out_cfg.hdr_colorspace = cfg.hdr_colorspace;
                 out_cfg.hdr_reference_white = cfg.hdr_reference_white;
                 out_cfg.hdr_gamut_strength = cfg.hdr_gamut_strength;
+                out_cfg.hdr_saturation = cfg.hdr_saturation;
+                out_cfg.hdr_midtone_gamma = cfg.hdr_midtone_gamma;
                 out_cfg.hdr_test_pattern = cfg.hdr_test_pattern;
             }
 
@@ -338,14 +340,16 @@ fn push_hdr_tuning_to_surfaces(state: &mut state::State) {
                     Some(cosmic_comp_config::output::comp::HdrColorspace::DciP3) => 1.0,
                     _ => 0.0,
                 };
-                let ref_white = cfg.hdr_reference_white.map(|n| n as f32).unwrap_or(500.0);
+                let ref_white = cfg.hdr_reference_white.map(|n| n as f32).unwrap_or(250.0);
                 let gamut_mix = cfg.hdr_gamut_strength.map(|p| (p as f32) / 100.0).unwrap_or(1.0);
+                let saturation = cfg.hdr_saturation.map(|p| (p as f32) / 100.0).unwrap_or(1.2);
+                let midtone_gamma = cfg.hdr_midtone_gamma.map(|p| (p as f32) / 100.0).unwrap_or(0.7);
                 let test_pattern = cfg.hdr_test_pattern.unwrap_or(false);
                 warn!(
-                    "[HDR] surgical push to {}: cs={:.1} ref_w={:.1} mix={:.2} test={}",
-                    connector_name, cs_for_shader, ref_white, gamut_mix, test_pattern
+                    "[HDR] surgical push to {}: cs={:.1} ref_w={:.1} mix={:.2} sat={:.2} gamma={:.2} test={}",
+                    connector_name, cs_for_shader, ref_white, gamut_mix, saturation, midtone_gamma, test_pattern
                 );
-                surface.set_hdr_tuning(cs_for_shader, ref_white, gamut_mix, test_pattern);
+                surface.set_hdr_tuning(cs_for_shader, ref_white, gamut_mix, saturation, midtone_gamma, test_pattern);
             }
             pushed += 1;
         }
