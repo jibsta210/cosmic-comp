@@ -111,7 +111,7 @@ use smithay_egui::EguiState;
 #[derive(Debug)]
 pub struct Surface {
     pub(crate) connector: connector::Handle,
-    pub(super) crtc: crtc::Handle,
+    pub(crate) crtc: crtc::Handle,
     pub(crate) output: Output,
     known_nodes: HashSet<DrmNode>,
 
@@ -161,6 +161,12 @@ pub struct SurfaceThreadState {
     hdr_saturation: f32,            // 1.0 = neutral, >1.0 = more vivid
     hdr_midtone_gamma: f32,         // 1.0 = neutral, <1.0 lifts SDR midtones into HDR range
     hdr_test_pattern: bool,
+    /// True when the kernel CRTC color pipeline (DEGAMMA + CTM + GAMMA)
+    /// is staged for this surface — the postprocess shader's PQ-encode
+    /// path becomes redundant (shader uses color_mode=7.0 = passthrough,
+    /// hardware does the encode). When false, shader runs the full
+    /// software encoding path (color_mode=5.0).
+    hdr_hardware_path_active: bool,
     postprocess_textures: HashMap<DrmNode, PostprocessState>,
 
     shell: Arc<parking_lot::RwLock<Shell>>,
@@ -230,6 +236,7 @@ pub enum ThreadCommand {
     UpdateMirroring(Option<Output>),
     UpdateScreenFilter(ScreenFilter),
     UpdateHdrEnabled(bool),
+    UpdateHdrHardwarePath(bool),
     UpdateHdrTuning {
         colorspace_for_shader: f32,
         ref_white: f32,
@@ -432,6 +439,17 @@ impl Surface {
     /// runs the offscreen postprocess pipeline with `color_mode=5.0` (PQ
     /// encode) regardless of `screen_filter` state, so output is BT.2020/PQ
     /// for the panel that's been signaled into HDR mode.
+    /// Tell the surface whether the kernel CRTC color pipeline is doing
+    /// the HDR encode (DEGAMMA+CTM+GAMMA staged via HdrState). When true
+    /// the shader switches to color_mode=7.0 (passthrough) so the encode
+    /// only happens once, in hardware. When false the shader runs the
+    /// full software path (color_mode=5.0).
+    pub fn set_hdr_hardware_path(&mut self, active: bool) {
+        let _ = self
+            .thread_command
+            .send(ThreadCommand::UpdateHdrHardwarePath(active));
+    }
+
     pub fn set_hdr_enabled(&mut self, enabled: bool) {
         warn!("[HDR] Surface::set_hdr_enabled({enabled}) -> dispatching ThreadCommand");
         let send_result = self
@@ -615,6 +633,7 @@ fn surface_thread(
         hdr_saturation: 1.2,            // mild vibrance boost to compensate for loss of vendor SDR enhancement
         hdr_midtone_gamma: 0.7,         // lift SDR midtones into HDR luminance range (Windows AutoHDR-like)
         hdr_test_pattern: false,
+        hdr_hardware_path_active: false,
         postprocess_textures: HashMap::new(),
 
         shell,
@@ -669,6 +688,14 @@ fn surface_thread(
             }
             Event::Msg(ThreadCommand::UpdateScreenFilter(filter_config)) => {
                 state.update_screen_filter(filter_config);
+            }
+            Event::Msg(ThreadCommand::UpdateHdrHardwarePath(active)) => {
+                warn!(
+                    "[HDR-HW] surface thread: hardware color pipeline active = {} (was {})",
+                    active, state.hdr_hardware_path_active
+                );
+                state.hdr_hardware_path_active = active;
+                state.queue_redraw(false);
             }
             Event::Msg(ThreadCommand::UpdateHdrEnabled(enabled)) => {
                 warn!(
@@ -1144,17 +1171,42 @@ impl SurfaceThreadState {
             remove_frame_flags |= FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT;
         }
 
-        // (Earlier this branch removed ALLOW_SCANOUT for HDR mode while we
-        //  were chasing a different bug — turned out the actual issue was
-        //  the main postprocess element being constructed with only 2
-        //  uniforms instead of 7 (see line ~2159). Now that all uniforms
-        //  reach the shader, direct scanout via primary plane bypasses the
-        //  shader so the panel sees raw sRGB content tagged as PQ — still
-        //  needs to be handled, but the proper fix is in smithay: make the
-        //  scanout-eligibility check shader-aware (TextureShaderElement
-        //  with custom shader = ineligible for direct scanout). Until that
-        //  smithay patch lands, this re-disables scanout when HDR is on.)
-        if self.hdr_enabled {
+        // Direct scanout (both primary and overlay planes) is disabled
+        // entirely when HDR is on, until per-surface color encoding
+        // negotiation lands via wp_color_management_v1 +
+        // wp_color_representation_v1 (Phase 3).
+        //
+        // Two distinct issues each break direct scanout in HDR today:
+        //
+        //   1. Overlay-plane direct scanout — kernel composites planes in
+        //      pre-DEGAMMA space with mixed per-plane encodings; result fed
+        //      into DEGAMMA isn't uniformly sRGB, so DEGAMMA decodes garbage.
+        //      Smithay's per-frame overlay-plane assignment heuristic flips
+        //      surfaces between overlay and primary frame-to-frame, causing
+        //      region-localized flicker on multi-window desktop.
+        //      (project_hdr_overlay_plane_bug.md)
+        //
+        //   2. Primary-plane direct scanout — the no-offscreen render path
+        //      has alpha/blend semantics that disagree with the offscreen
+        //      path. Opaque clients (Firefox) render correctly, but clients
+        //      with alpha < 1.0 (panels, popups, drop-shadows) appear
+        //      translucent / z-fight against windows beneath during motion.
+        //      Toggling VRR forces a full atomic commit() that re-stages
+        //      plane properties and "fixes" it briefly, confirming plane-
+        //      level state drift between commits in the no-offscreen path.
+        //      Tried Xbgr2101010/Xrgb2101010 alpha-less primary fb formats —
+        //      did not fix.
+        //
+        // Both share a root cause: cosmic-comp/smithay don't know each
+        // plane's color encoding contract. Phase 3 protocols give us per-
+        // surface encoding metadata, which lets us reject non-matching
+        // surfaces from scanout or normalize them. Until then, force the
+        // offscreen pass for any HDR rendering — costs us one full-screen
+        // blit per frame, but the visual is correct on every kind of
+        // window.
+        let hdr_shader_needed = self.hdr_enabled;
+        let shader_load_bearing = !self.screen_filter.is_noop() || hdr_shader_needed;
+        if hdr_shader_needed {
             remove_frame_flags |= FrameFlags::ALLOW_SCANOUT;
             remove_frame_flags |= FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT;
         }
@@ -1198,22 +1250,35 @@ impl SurfaceThreadState {
         };
 
         // actual rendering
-        // We force the offscreen postprocess pipeline whenever HDR is enabled
-        // (in addition to screen-filter / mirroring cases), so the PQ encode
-        // shader (color_mode=5.0) runs before scanout.
-        let needs_offscreen = !self.screen_filter.is_noop() || self.hdr_enabled;
-        // Log transitions only (once per state change) — helps confirm whether
-        // self.hdr_enabled is actually `true` here when output_config says so.
+        // We need the offscreen postprocess pipeline whenever the shader is
+        // doing real work — screen filter, software HDR PQ encode (color_mode=5),
+        // HDR test pattern (color_mode=6), or HDR tuner sat/gamma on top of the
+        // hardware path (color_mode=8). When the hardware color pipeline is
+        // active and the tuner is at neutral with no test pattern, the shader
+        // is pure passthrough (color_mode=7) so we can skip offscreen entirely
+        // and let smithay scan the primary plane out directly — the CRTC
+        // degamma/CTM/gamma LUTs do all the HDR work on the panel side.
+        let needs_offscreen = shader_load_bearing;
+        // Log transitions only (once per state change) — helps confirm both
+        // that self.hdr_enabled is actually `true` here when output_config
+        // says so AND whether we're scanning out directly vs going through
+        // the postprocess offscreen pass.
         {
             use std::sync::atomic::{AtomicU8, Ordering};
             static LAST_STATE: AtomicU8 = AtomicU8::new(0xFF);
-            let bits = (self.hdr_enabled as u8) | ((needs_offscreen as u8) << 1)
-                | ((!self.screen_filter.is_noop() as u8) << 2);
+            let bits = (self.hdr_enabled as u8)
+                | ((needs_offscreen as u8) << 1)
+                | ((!self.screen_filter.is_noop() as u8) << 2)
+                | ((self.hdr_hardware_path_active as u8) << 3)
+                | ((self.hdr_test_pattern as u8) << 4);
             if LAST_STATE.swap(bits, Ordering::Relaxed) != bits {
                 warn!(
                     hdr_enabled = self.hdr_enabled,
+                    hw_path = self.hdr_hardware_path_active,
+                    test_pattern = self.hdr_test_pattern,
                     screen_filter_active = !self.screen_filter.is_noop(),
                     needs_offscreen,
+                    scanout_allowed = !needs_offscreen,
                     "[HDR] render-loop state transition"
                 );
             }
@@ -1409,6 +1474,7 @@ impl SurfaceThreadState {
                 self.hdr_saturation,
                 self.hdr_midtone_gamma,
                 self.hdr_test_pattern,
+                self.hdr_hardware_path_active,
             );
 
             if let Err(err) = compositor.with_compositor(|c| c.use_vrr(vrr)) {
@@ -2054,16 +2120,40 @@ fn postprocess_elements<'a>(
     hdr_saturation: f32,
     hdr_midtone_gamma: f32,
     hdr_test_pattern: bool,
+    hdr_hardware_path_active: bool,
 ) -> Vec<CosmicElement<GlMultiRenderer<'a>>> {
-    // HDR PQ encode (color_mode=5.0) takes precedence over screen-filter
-    // color modes — they're effects on top of SDR sRGB content; once we've
-    // committed to outputting a BT.2020 PQ-encoded framebuffer, applying a
-    // greyscale or daltonization matrix in sRGB space and *then* encoding to
-    // PQ would still produce the right result, but then we'd need TWO color
-    // modes active. Phase 1 keeps it simple: HDR alone, no compositing of
-    // accessibility filters with HDR yet.
+    // color_mode selection:
+    //   0   = SDR no filter (existing)
+    //   1-4 = SDR screen filter (greyscale + daltonization, existing)
+    //   5   = software HDR fallback (no hardware color pipeline available;
+    //         shader does sRGB→linear→matrix→ref_white→PQ end-to-end)
+    //   6   = HDR test pattern (calibration grid generated in shader)
+    //   7   = hardware HDR with neutral tuner (CRTC pipeline does encode;
+    //         shader is identity passthrough)
+    //   8   = hardware HDR with non-neutral sat/gamma slider (shader applies
+    //         the sat/gamma curves in linear space then sRGB-re-encodes;
+    //         hardware then does DEGAMMA → CTM → GAMMA_LUT)
+    //
+    // Sat / gamma intentionally live in the shader (uniform updates apply
+    // on next render frame — free) rather than in the CTM / GAMMA_LUT
+    // blobs (which would need an atomic commit() per slider tick to push
+    // to the kernel; Intel xe rejects per-frame full commits under motion
+    // → moving-window glitches).
+    //
+    // Hardware path's CTM is `gamut + ref_white` only (saturation in the
+    // CTM math is set to 1.0 / identity at staging time). GAMMA_LUT is
+    // plain PQ encode (no gamma curve baked in). Shader picks up where
+    // those leave off via color_mode=8.
+    let tuner_at_neutral = (hdr_saturation - 1.0).abs() < 0.01
+        && (hdr_midtone_gamma - 1.0).abs() < 0.01;
     let color_mode_value: f32 = if hdr_enabled {
-        if hdr_test_pattern { 6.0 } else { 5.0 }
+        if hdr_test_pattern {
+            6.0
+        } else if hdr_hardware_path_active {
+            if tuner_at_neutral { 7.0 } else { 8.0 }
+        } else {
+            5.0
+        }
     } else {
         screen_filter
             .color_filter

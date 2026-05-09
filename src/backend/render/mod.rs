@@ -84,6 +84,7 @@ pub mod animations;
 pub mod clipped_surface;
 pub mod cursor;
 pub mod element;
+pub mod hw_color_pipeline;
 pub mod shadow;
 use self::element::{AsGlowRenderer, CosmicElement};
 

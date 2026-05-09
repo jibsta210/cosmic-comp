@@ -309,6 +309,15 @@ fn push_hdr_tuning_to_surfaces(state: &mut state::State) {
 
     let mut pushed = 0usize;
     for device in kms.drm_devices.values_mut() {
+        // (Live CTM/GAMMA_LUT regen on SIGUSR1 was tried, but couldn't
+        // be made stable on Intel xe under motion — re-committing the
+        // CRTC color pipeline blobs requires an atomic commit() per
+        // slider tick, which xe rejects intermittently and causes
+        // moving-window glitches. Reverted; sat/gamma live in shader
+        // uniforms instead, ref_white only updates on the next natural
+        // commit (mode change, vrr toggle, display reconfig). Phase 3
+        // protocols give us a cleaner per-surface live-update path.)
+
         for surface in device.inner.surfaces.values_mut() {
             let connector_name = surface.output.name();
             let Some(cfg) = snapshot
@@ -350,6 +359,7 @@ fn push_hdr_tuning_to_surfaces(state: &mut state::State) {
                     connector_name, cs_for_shader, ref_white, gamut_mix, saturation, midtone_gamma, test_pattern
                 );
                 surface.set_hdr_tuning(cs_for_shader, ref_white, gamut_mix, saturation, midtone_gamma, test_pattern);
+
             }
             pushed += 1;
         }

@@ -55,7 +55,7 @@ use std::{
 };
 
 mod device;
-mod drm_helpers;
+pub(crate) mod drm_helpers;
 pub mod render;
 mod socket;
 mod surface;
@@ -1230,10 +1230,7 @@ impl KmsGuard<'_> {
                                     // Use panel-EDID-spec mastering values
                                     // matching KWin's reference implementation
                                     // (KDE Plasma 6 sources panel max_cll/fall
-                                    // from EDID, not from content). The earlier
-                                    // experiment with content-derived values
-                                    // didn't visibly help and diverges from
-                                    // upstream best practice.
+                                    // from EDID, not from content).
                                     let lum =
                                         drm_helpers::HdrMasteringLuminance::fallback_oled();
                                     warn!(
@@ -1246,9 +1243,65 @@ impl KmsGuard<'_> {
                                             lum,
                                             container,
                                         )?;
+                                    // Hardware CRTC color pipeline probe.
+                                    // When present (DEGAMMA_LUT + CTM +
+                                    // GAMMA_LUT all exposed), generate LUTs
+                                    // and the gamut+ref_white CTM, create
+                                    // blobs, and stage them via smithay's
+                                    // HdrState extension. The shader's PQ
+                                    // encode path becomes redundant — see
+                                    // the surface render thread's color_mode
+                                    // selection. When absent, leave the LUT
+                                    // blob IDs as None and the shader takes
+                                    // over per the existing color_mode=5 path.
+                                    use crate::backend::render::hw_color_pipeline as hw;
+                                    let (degamma_blob, ctm_blob, gamma_blob) =
+                                        if drm_helpers::crtc_has_color_pipeline(drm.device(), *crtc) {
+                                            let degamma_size = drm_helpers::crtc_degamma_lut_size(drm.device(), *crtc).unwrap_or(0);
+                                            let gamma_size = drm_helpers::crtc_gamma_lut_size(drm.device(), *crtc).unwrap_or(0);
+                                            let content_ref_white = hdr_ref_white_setting
+                                                .map(|n| n as u16)
+                                                .unwrap_or(250);
+                                            let initial_gamut_mix = hdr_gamut_strength_setting
+                                                .map(|p| (p as f32) / 100.0)
+                                                .unwrap_or(1.0);
+                                            let degamma_lut = hw::srgb_decode_lut(degamma_size);
+                                            // Plain PQ encode in GAMMA_LUT — gamma slider is
+                                            // applied in the shader (color_mode=8), not baked
+                                            // into the LUT. Reason: live SIGUSR1 updates can't
+                                            // re-commit CRTC color blobs without triggering an
+                                            // atomic commit() per frame, which Intel xe rejects
+                                            // under motion (causes window-move glitches).
+                                            // Shader uniforms apply on next render frame for
+                                            // free, so sat/gamma stay there for live response.
+                                            let gamma_lut = hw::pq_encode_lut(gamma_size);
+                                            // CTM = gamut remap × ref_white scale, sat=1.0
+                                            // (identity / no saturation in CTM). Saturation
+                                            // also lives in the shader for the same reason.
+                                            let ctm = hw::gamut_ctm_with_ref_white(
+                                                container,
+                                                content_ref_white,
+                                                initial_gamut_mix,
+                                                1.0,
+                                            );
+                                            let degamma_blob = drm_helpers::create_color_lut_blob(drm.device(), &degamma_lut)?;
+                                            let gamma_blob = drm_helpers::create_color_lut_blob(drm.device(), &gamma_lut)?;
+                                            let ctm_blob = drm_helpers::create_ctm_blob(drm.device(), &ctm)?;
+                                            warn!(
+                                                "[HDR-HW] CRTC color pipeline staged: degamma_size={} gamma_size={} ref_white={}nits gamut_mix={:.2} container={:?} (sat/gamma live in shader)",
+                                                degamma_size, gamma_size, content_ref_white, initial_gamut_mix, container
+                                            );
+                                            (Some(degamma_blob), Some(ctm_blob), Some(gamma_blob))
+                                        } else {
+                                            warn!("[HDR-HW] CRTC lacks color pipeline props; using shader path");
+                                            (None, None, None)
+                                        };
                                     Ok(smithay::backend::drm::HdrState {
                                         colorspace_value,
                                         metadata_blob_id,
+                                        degamma_lut_blob_id: degamma_blob,
+                                        ctm_blob_id: ctm_blob,
+                                        gamma_lut_blob_id: gamma_blob,
                                     })
                                 })();
                                 match setup_result {
@@ -1281,6 +1334,18 @@ impl KmsGuard<'_> {
                                         // Tell the surface render loop to use the PQ
                                         // post-process shader (color_mode=5.0 / 6.0).
                                         surface.set_hdr_enabled(true);
+                                        // Tell surface whether the hardware CRTC color
+                                        // pipeline is doing the encoding. When it is,
+                                        // shader switches to color_mode=7.0 (passthrough)
+                                        // so encoding only happens once (in hardware).
+                                        let hw_path = hdr_state.degamma_lut_blob_id.is_some()
+                                            && hdr_state.ctm_blob_id.is_some()
+                                            && hdr_state.gamma_lut_blob_id.is_some();
+                                        surface.set_hdr_hardware_path(hw_path);
+                                        warn!(
+                                            "[HDR-HW] surface.set_hdr_hardware_path({}) — shader will use color_mode={}",
+                                            hw_path, if hw_path { 7 } else { 5 }
+                                        );
                                         // Push the live shader tuning the user has configured
                                         // (or defaults if outputs.ron doesn't carry HDR
                                         // tuning yet). The hdr-tuner GUI updates these by

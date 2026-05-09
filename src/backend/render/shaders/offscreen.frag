@@ -116,7 +116,69 @@ void main() {
     // framebuffer is 10-bit Abgr2101010 wired to a connector with the
     // matching Colorspace + HDR_OUTPUT_METADATA (PQ EOTF). All math from
     // public standards (BT.2100, BT.2087, ST 2084, BT.2408).
-    if (color_mode >= 5.0) {
+    // ---- Hardware HDR path (color_mode == 7.0) --------------------------
+    // CRTC color pipeline (DEGAMMA_LUT + CTM + GAMMA_LUT) is staged via
+    // smithay's `HdrState`; the kernel display engine handles sRGB decode
+    // → gamut + ref-white scale → PQ encode entirely in fixed-function
+    // hardware on output. Shader's only job here is "stay out of the way":
+    // pass framebuffer-tagged sRGB content through unchanged so the hardware
+    // pipeline gets canonical sRGB at its DEGAMMA input.
+    //
+    // Tunable saturation / midtone-gamma in this mode would require a
+    // sRGB-decode → adjust-in-linear → sRGB-re-encode shader pass that
+    // stays "below" the hardware encoding. Deferred — Phase 2A.2 work.
+    // For now, color_mode=7 means: shader is a no-op; user's saturation
+    // and midtone gamma sliders affect nothing while in hardware path.
+    if (color_mode > 6.5 && color_mode < 7.5) {
+        // Skip the PQ encode block below entirely. color stays sRGB-ish
+        // (whatever cosmic rendered), hardware handles HDR encoding.
+    } else if (color_mode > 7.5 && color_mode < 8.5) {
+        // ---- Hardware HDR with shader saturation+midtone tuning -------
+        // Hardware CRTC pipeline does sRGB-decode → CTM (gamut+ref_white)
+        // → PQ-encode on output. Shader's job here is to pre-modify the
+        // sRGB framebuffer values for tuner saturation + midtone gamma
+        // BEFORE the hardware DEGAMMA_LUT picks them up. To do that we
+        // sRGB-decode in shader, apply the sat/gamma curves in linear
+        // luminance space (chroma-preserving), then sRGB-re-encode so
+        // the hardware's DEGAMMA gets canonical sRGB input again.
+        // No PQ encode in shader — hardware does it.
+        vec3 lin8;
+        lin8.r = (color.r <= 0.04045) ? color.r / 12.92 : pow((color.r + 0.055) / 1.055, 2.4);
+        lin8.g = (color.g <= 0.04045) ? color.g / 12.92 : pow((color.g + 0.055) / 1.055, 2.4);
+        lin8.b = (color.b <= 0.04045) ? color.b / 12.92 : pow((color.b + 0.055) / 1.055, 2.4);
+
+        // Midtone gamma in luminance space (preserves chroma).
+        // Sensitivity dampening: in the hardware path, the shader applies
+        // gamma in 709 linear space and the hardware CTM then maps
+        // 709→BT.2020 + ref_white scale before the GAMMA_LUT does inverse-PQ
+        // encode. Because PQ is very steep through low/midtones, a small
+        // linear-domain gamma change becomes a large PQ-domain perceptual
+        // change. Empirically the slider at 1.10 here ≈ 2.00 slider in the
+        // old software path — halve the raw slider deviation from 1.0 so the
+        // tuner has more granularity / breathing room.
+        float gamma8_raw = (hdr_midtone_gamma < 0.1) ? 1.0 : hdr_midtone_gamma;
+        float gamma8 = 1.0 + (gamma8_raw - 1.0) * 0.5;
+        float Y_orig8 = dot(lin8, vec3(0.2627, 0.6780, 0.0593));
+        float Y_new8 = pow(max(Y_orig8, 0.0), gamma8);
+        float lift8 = (Y_orig8 > 0.0001) ? (Y_new8 / Y_orig8) : 1.0;
+        vec3 lin8_lifted = lin8 * lift8;
+
+        // Saturation (mix between luma-only and full chroma).
+        float sat8 = (hdr_saturation < 0.5) ? 1.0 : hdr_saturation;
+        float Y_lifted8 = dot(lin8_lifted, vec3(0.2627, 0.6780, 0.0593));
+        vec3 lin8_final = mix(vec3(Y_lifted8), lin8_lifted, sat8);
+        lin8_final = clamp(lin8_final, vec3(0.0), vec3(1.0));
+
+        // sRGB re-encode (piecewise inverse of decode above).
+        vec3 srgb8;
+        srgb8.r = (lin8_final.r <= 0.0031308) ? 12.92 * lin8_final.r
+                : 1.055 * pow(lin8_final.r, 1.0 / 2.4) - 0.055;
+        srgb8.g = (lin8_final.g <= 0.0031308) ? 12.92 * lin8_final.g
+                : 1.055 * pow(lin8_final.g, 1.0 / 2.4) - 0.055;
+        srgb8.b = (lin8_final.b <= 0.0031308) ? 12.92 * lin8_final.b
+                : 1.055 * pow(lin8_final.b, 1.0 / 2.4) - 0.055;
+        color.rgb = clamp(srgb8, vec3(0.0), vec3(1.0));
+    } else if (color_mode >= 5.0) {
         // ---- Source pixel: either real content (5.0) or test pattern (6.0).
         vec3 src = color.rgb;
         if (color_mode > 5.5) {

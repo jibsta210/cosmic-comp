@@ -620,6 +620,123 @@ pub fn create_hdr_metadata_blob(
     Ok(blob.into())
 }
 
+// =====================================================================
+// CRTC color pipeline (DEGAMMA_LUT, CTM, GAMMA_LUT) helpers
+// =====================================================================
+//
+// These wrap the kernel KMS color-pipeline blob creation so the higher-
+// level HDR setup can stage hardware encode (sRGB decode + gamut + ref-
+// white scale + PQ encode) entirely in the display engine's fixed-
+// function color blocks instead of doing it in the GLES postprocess
+// shader on every frame.
+//
+// LUT generation lives in `crate::backend::render::hw_color_pipeline`
+// (pure math, unit-tested). This file owns the kernel ABI side: probe
+// LUT sizes from the CRTC, build blobs, return blob IDs for smithay's
+// `HdrState`.
+
+/// Read a CRTC's `DEGAMMA_LUT_SIZE` or `GAMMA_LUT_SIZE` (or any range
+/// property by name). Returns `Some(size)` on success, `None` if the
+/// property doesn't exist on this CRTC (older driver / hardware without
+/// hardware color pipeline support — caller should fall back to shader).
+pub fn get_crtc_range_prop(
+    dev: &impl ControlDevice,
+    crtc: crtc::Handle,
+    name: &str,
+) -> Option<u64> {
+    let props = dev.get_properties(crtc).ok()?;
+    let (handles, values) = props.as_props_and_values();
+    for (handle, value) in handles.iter().zip(values.iter()) {
+        let info = dev.get_property(*handle).ok()?;
+        if info.name().to_str().ok() == Some(name) {
+            return Some(*value);
+        }
+    }
+    None
+}
+
+/// Convenience: returns the CRTC's `DEGAMMA_LUT_SIZE` if exposed.
+/// On Intel xe + Tandem OLED this is 129; on AMD it varies; on hardware
+/// without the property at all this is `None`.
+pub fn crtc_degamma_lut_size(
+    dev: &impl ControlDevice,
+    crtc: crtc::Handle,
+) -> Option<u32> {
+    get_crtc_range_prop(dev, crtc, "DEGAMMA_LUT_SIZE").map(|v| v as u32)
+}
+
+/// Convenience: returns the CRTC's `GAMMA_LUT_SIZE`. Intel xe reports
+/// 1024 here; older Intel typically 256.
+pub fn crtc_gamma_lut_size(
+    dev: &impl ControlDevice,
+    crtc: crtc::Handle,
+) -> Option<u32> {
+    get_crtc_range_prop(dev, crtc, "GAMMA_LUT_SIZE").map(|v| v as u32)
+}
+
+/// Returns true if the CRTC has all three properties needed for the
+/// hardware-accelerated HDR encode path: `DEGAMMA_LUT`, `CTM`, `GAMMA_LUT`.
+/// The legacy CTM API (stable since ~Linux 4.6 on Intel/AMD) — newer
+/// drivers may also expose a colorop API but we don't need it for our
+/// encode pipeline.
+pub fn crtc_has_color_pipeline(
+    dev: &impl ControlDevice,
+    crtc: crtc::Handle,
+) -> bool {
+    crtc_degamma_lut_size(dev, crtc).is_some_and(|s| s >= 2)
+        && get_crtc_range_prop(dev, crtc, "GAMMA_LUT_SIZE").is_some_and(|s| s >= 2)
+        && {
+            // CTM is a blob, not a range — probe via property handle existence.
+            let Ok(props) = dev.get_properties(crtc) else { return false };
+            let (handles, _) = props.as_props_and_values();
+            handles.iter().any(|h| {
+                dev.get_property(*h)
+                    .ok()
+                    .and_then(|info| info.name().to_str().ok().map(|n| n == "CTM"))
+                    .unwrap_or(false)
+            })
+        }
+}
+
+/// Create a kernel property blob from a `Vec<DrmColorLutEntry>`. The kernel
+/// expects the bytes laid out as `struct drm_color_lut[]` — RGB+reserved
+/// u16 quads, exactly what `DrmColorLutEntry` already is via `#[repr(C, packed)]`.
+///
+/// `create_property_blob` requires `T: Sized` so we copy into a heap-owned
+/// `Vec<u8>` first (already-Sized via the Vec's pointer/length/capacity).
+pub fn create_color_lut_blob(
+    dev: &impl ControlDevice,
+    entries: &[crate::backend::render::hw_color_pipeline::DrmColorLutEntry],
+) -> Result<u64> {
+    let bytes: Vec<u8> = unsafe {
+        std::slice::from_raw_parts(
+            entries.as_ptr() as *const u8,
+            std::mem::size_of_val(entries),
+        )
+    }
+    .to_vec();
+    let blob = dev
+        .create_property_blob(&bytes)
+        .context("create color LUT blob")?;
+    Ok(blob.into())
+}
+
+/// Create a kernel property blob from a CTM matrix encoded as 9 u64
+/// sign-magnitude S31.32 values (kernel `struct drm_color_ctm`).
+pub fn create_ctm_blob(dev: &impl ControlDevice, matrix: &[u64; 9]) -> Result<u64> {
+    let bytes: Vec<u8> = unsafe {
+        std::slice::from_raw_parts(
+            matrix.as_ptr() as *const u8,
+            std::mem::size_of::<[u64; 9]>(),
+        )
+    }
+    .to_vec();
+    let blob = dev
+        .create_property_blob(&bytes)
+        .context("create CTM blob")?;
+    Ok(blob.into())
+}
+
 pub fn panel_orientation(dev: &impl ControlDevice, conn: connector::Handle) -> Result<Transform> {
     let (val_type, val) = get_property_val(dev, conn, "panel orientation")?;
     match val_type.convert_value(val) {
