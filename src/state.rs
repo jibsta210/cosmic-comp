@@ -73,6 +73,7 @@ use smithay::{
     utils::{Clock, Monotonic, Point},
     wayland::{
         alpha_modifier::AlphaModifierState,
+        color_management::{ColorManagementCapabilities, ColorManagementState},
         compositor::{CompositorClientState, CompositorState, SurfaceData},
         cursor_shape::CursorShapeManagerState,
         dmabuf::{DmabufFeedback, DmabufGlobal, DmabufState},
@@ -248,6 +249,7 @@ pub struct Common {
     pub theme: cosmic::Theme,
 
     // wayland state
+    pub color_management_state: ColorManagementState,
     pub compositor_state: CompositorState,
     pub corner_radius_state: CornerRadiusState,
     pub data_device_state: DataDeviceState,
@@ -679,6 +681,8 @@ impl State {
         TextInputManagerState::new::<Self>(dh);
         VirtualKeyboardManagerState::new::<State, _>(dh, client_not_sandboxed);
         AlphaModifierState::new::<Self>(dh);
+        let color_management_state =
+            ColorManagementState::new::<Self>(dh, ColorManagementCapabilities::conservative());
         SinglePixelBufferState::new::<Self>(dh);
         FixesState::new::<Self>(dh);
 
@@ -756,6 +760,7 @@ impl State {
                 kiosk_child: None,
                 theme: cosmic::theme::system_preference(),
 
+                color_management_state,
                 compositor_state,
                 corner_radius_state,
                 data_device_state,

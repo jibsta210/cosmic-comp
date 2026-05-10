@@ -237,6 +237,12 @@ pub fn run(hooks: crate::hooks::Hooks) -> Result<(), Box<dyn Error>> {
             }
         }
 
+        // Flush queued color-management destructor events (info `done()` /
+        // description `failed(...)`) outside any dispatch callback. Sending
+        // these inside dispatch panics wayland-backend (common_poll.rs:284).
+        // Must happen before flush_clients so events go out in this round.
+        state.common.color_management_state.flush_pending();
+
         // send out events
         let _ = state.common.display_handle.flush_clients();
 
