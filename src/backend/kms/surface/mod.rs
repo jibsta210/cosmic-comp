@@ -2058,8 +2058,20 @@ fn send_screencopy_result<'a>(
             // through screencopy_sdr_shader which inverts the linearize
             // pipeline: undo ref_white scale → BT.2020→BT.709 matrix →
             // linear→sRGB encode.
+            // GATE OFF: the path_b_tonedown render pass causes the live
+            // desktop to render washed, even though it only writes to the
+            // screencopy client's framebuffer and not to the main offscreen.
+            // Hypothesis: the per-frame screencopy from cosmic-shell's
+            // workspace-overview / app-library thumbnails triggers this
+            // path constantly, and the renderer state (sampler bindings,
+            // texture program, sync fences) leaks back into the next
+            // postprocess pass. Reverting to the raw blit (which produces
+            // broken screenshots, the pre-0dc0cb50 behavior) is the lesser
+            // evil until the leak is identified. Set
+            // COSMIC_HDR_PATH_B_TONEDOWN=1 to re-enable for testing.
             let path_b_tonedown = hdr_ref_white_for_path_b > 0.0
-                && matches!(tex.format(), Some(Fourcc::Abgr16161616f));
+                && matches!(tex.format(), Some(Fourcc::Abgr16161616f))
+                && std::env::var("COSMIC_HDR_PATH_B_TONEDOWN").is_ok();
 
             if path_b_tonedown {
                 if let Some(fb) = fb.as_mut() {
