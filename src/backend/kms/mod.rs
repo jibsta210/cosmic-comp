@@ -1255,8 +1255,21 @@ impl KmsGuard<'_> {
                                     // blob IDs as None and the shader takes
                                     // over per the existing color_mode=5 path.
                                     use crate::backend::render::hw_color_pipeline as hw;
+                                    // Path B (COSMIC_HDR_PATH_B=1) does the color
+                                    // transform per-surface in the shader; the
+                                    // CRTC color pipeline must be passthrough
+                                    // or its DEGAMMA/CTM/GAMMA would double-apply
+                                    // on top of what the shader already did,
+                                    // producing visibly wrong colors. Skip the
+                                    // blob setup → hw_path stays false →
+                                    // surface uses shader-only color_mode=5.
                                     let (degamma_blob, ctm_blob, gamma_blob) =
-                                        if drm_helpers::crtc_has_color_pipeline(drm.device(), *crtc) {
+                                        if crate::backend::render::clipped_surface::path_b_enabled() {
+                                            warn!(
+                                                "[HDR-HW] COSMIC_HDR_PATH_B=1: skipping CRTC color pipeline blobs (Path B shader-only path)"
+                                            );
+                                            (None, None, None)
+                                        } else if drm_helpers::crtc_has_color_pipeline(drm.device(), *crtc) {
                                             let degamma_size = drm_helpers::crtc_degamma_lut_size(drm.device(), *crtc).unwrap_or(0);
                                             let gamma_size = drm_helpers::crtc_gamma_lut_size(drm.device(), *crtc).unwrap_or(0);
                                             let content_ref_white = hdr_ref_white_setting

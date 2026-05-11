@@ -237,6 +237,12 @@ impl IndicatorShader {
         scale: f64,
         color: [f32; 3],
     ) -> PixelShaderElement {
+        // Path B — when an HDR frame is rendering with Path B active, the
+        // offscreen FB is linear and the postprocess shader skips sRGB
+        // decode. Linearize the color here so what we write to the offscreen
+        // matches what surfaces write (linear in composite space).
+        let color =
+            crate::backend::render::clipped_surface::linearize_srgb_color_for_path_b(color);
         let settings = IndicatorSettings {
             thickness,
             outer_radius,
@@ -330,6 +336,9 @@ impl BackdropShader {
         alpha: f32,
         color: [f32; 3],
     ) -> PixelShaderElement {
+        // Path B — see IndicatorShader::element for rationale.
+        let color =
+            crate::backend::render::clipped_surface::linearize_srgb_color_for_path_b(color);
         let settings = BackdropSettings {
             radius,
             alpha,
@@ -425,6 +434,10 @@ pub fn init_shaders(renderer: &mut GlesRenderer) -> Result<(), GlesError> {
             UniformName::new("hdr_gamut_mix", UniformType::_1f),
             UniformName::new("hdr_saturation", UniformType::_1f),
             UniformName::new("hdr_midtone_gamma", UniformType::_1f),
+            // Path B activation flag — 1.0 when COSMIC_HDR_PATH_B=1 + HDR is
+            // on, signaling color_mode=5 to skip the sRGB-decode + matrix +
+            // ref_white stages (already done per-surface in clipped_surface.frag).
+            UniformName::new("path_b_active", UniformType::_1f),
         ],
     )?;
     // Path B core — the clipping shader was extended (in clipped_surface.frag)
@@ -626,6 +639,45 @@ pub enum ElementFilter {
     All,
     ExcludeWorkspaceOverview,
     LayerShellOnly,
+}
+
+/// Wrap a batch of `WaylandSurfaceRenderElement`s in
+/// `ClippedSurfaceRenderElement` with no-op corner_radius when an HDR Path B
+/// frame is rendering, so they pick up the linearize shader. Outside Path B
+/// (SDR mode, or HDR-but-no-Path-B), pass them through as
+/// `WorkspaceRenderElement::OverrideRedirect`.
+///
+/// Used by the `Stage::LayerPopup` / `LayerSurface` / `OverrideRedirect`
+/// render arms — surfaces that don't otherwise go through cosmic-mapped
+/// element render (which has its own HDR wrap path in
+/// shell/element/{window,stack}.rs).
+fn wrap_for_path_b<R>(
+    renderer: &mut R,
+    wsrs: Vec<smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement<R>>,
+    scale: Scale<f64>,
+) -> Vec<WorkspaceRenderElement<R>>
+where
+    R: AsGlowRenderer + smithay::backend::renderer::ImportAll + smithay::backend::renderer::ImportMem,
+    R::TextureId: Clone + 'static,
+    R::Error: FromGlesError,
+    CosmicMappedRenderElement<R>: smithay::backend::renderer::element::RenderElement<R>,
+{
+    let active = crate::backend::render::clipped_surface::render_hdr_active();
+    wsrs.into_iter()
+        .map(|wsr| {
+            if active {
+                use smithay::backend::renderer::element::Element;
+                let elem_geo = wsr.geometry(scale).to_f64().to_logical(scale);
+                WorkspaceRenderElement::Linearized(
+                    crate::backend::render::clipped_surface::ClippedSurfaceRenderElement::new(
+                        renderer, wsr, scale, elem_geo, [0u8; 4],
+                    ),
+                )
+            } else {
+                WorkspaceRenderElement::OverrideRedirect(wsr)
+            }
+        })
+        .collect()
 }
 
 pub fn output_elements<R>(
@@ -854,44 +906,49 @@ where
             Stage::LayerPopup {
                 popup, location, ..
             } => {
+                let wsrs = render_elements_from_surface_tree::<_, WaylandSurfaceRenderElement<_>>(
+                    renderer,
+                    popup.wl_surface(),
+                    location
+                        .to_local(output)
+                        .as_logical()
+                        .to_physical_precise_round(scale),
+                    Scale::from(scale),
+                    1.0,
+                    FRAME_TIME_FILTER,
+                );
                 elements.extend(
-                    render_elements_from_surface_tree::<_, WorkspaceRenderElement<_>>(
-                        renderer,
-                        popup.wl_surface(),
-                        location
-                            .to_local(output)
-                            .as_logical()
-                            .to_physical_precise_round(scale),
-                        Scale::from(scale),
-                        1.0,
-                        FRAME_TIME_FILTER,
-                    )
-                    .into_iter()
-                    .flat_map(crop_to_output)
-                    .map(Into::into),
+                    wrap_for_path_b(renderer, wsrs, Scale::from(scale))
+                        .into_iter()
+                        .flat_map(crop_to_output)
+                        .map(Into::into),
                 );
             }
             Stage::LayerSurface { layer, location } => {
+                let wsrs = render_elements_from_surface_tree::<_, WaylandSurfaceRenderElement<_>>(
+                    renderer,
+                    layer.wl_surface(),
+                    location
+                        .to_local(output)
+                        .as_logical()
+                        .to_physical_precise_round(scale),
+                    Scale::from(scale),
+                    1.0,
+                    FRAME_TIME_FILTER,
+                );
                 elements.extend(
-                    render_elements_from_surface_tree::<_, WorkspaceRenderElement<_>>(
-                        renderer,
-                        layer.wl_surface(),
-                        location
-                            .to_local(output)
-                            .as_logical()
-                            .to_physical_precise_round(scale),
-                        Scale::from(scale),
-                        1.0,
-                        FRAME_TIME_FILTER,
-                    )
-                    .into_iter()
-                    .flat_map(crop_to_output)
-                    .map(Into::into),
+                    wrap_for_path_b(renderer, wsrs, Scale::from(scale))
+                        .into_iter()
+                        .flat_map(crop_to_output)
+                        .map(Into::into),
                 );
             }
             Stage::OverrideRedirect { surface, location } => {
-                elements.extend(surface.wl_surface().into_iter().flat_map(|surface| {
-                    render_elements_from_surface_tree::<_, WorkspaceRenderElement<_>>(
+                if let Some(surface) = surface.wl_surface() {
+                    let wsrs = render_elements_from_surface_tree::<
+                        _,
+                        WaylandSurfaceRenderElement<_>,
+                    >(
                         renderer,
                         &surface,
                         location
@@ -901,11 +958,14 @@ where
                         Scale::from(scale),
                         1.0,
                         FRAME_TIME_FILTER,
-                    )
-                    .into_iter()
-                    .flat_map(crop_to_output)
-                    .map(Into::into)
-                }));
+                    );
+                    elements.extend(
+                        wrap_for_path_b(renderer, wsrs, Scale::from(scale))
+                            .into_iter()
+                            .flat_map(crop_to_output)
+                            .map(Into::into),
+                    );
+                }
             }
             Stage::StickyPopups(layout) => {
                 let alpha = match &overview.0 {

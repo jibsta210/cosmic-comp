@@ -23,6 +23,16 @@ uniform float tint;
 uniform float invert;
 uniform float color_mode;
 
+// Path B (COSMIC_HDR_PATH_B=1) — when 1.0, the offscreen FB is RGBA16F linear
+// in the composite color space with SDR ref_white already scaled in (the
+// per-surface linearize stage in clipped_surface.frag did sRGB→linear→
+// BT.709→BT.2020 matrix→ref_white). Postprocess's color_mode=5 branch skips
+// those stages and only applies sat/gamma + PQ encode.
+//
+// When 0.0 (default), color_mode=5 does the full sRGB→linear→matrix→
+// ref_white→PQ pipeline as before.
+uniform float path_b_active;
+
 // HDR tuning uniforms (only meaningful when color_mode >= 5.0).
 //   hdr_colorspace: 0.0 = BT.2020 target, 1.0 = DCI-P3 target.
 //   hdr_ref_white:  SDR white anchor in cd/m^2 (e.g. 100..500). Defaults
@@ -218,8 +228,10 @@ void main() {
 
         // 1. sRGB → linear (piecewise sRGB EOTF). For test pattern we put
         //    linear values straight through by gating; checked above.
+        //    PATH B: input is already linear from per-surface linearize stage,
+        //    so this is also a passthrough.
         vec3 lin;
-        if (color_mode > 5.5) {
+        if (color_mode > 5.5 || path_b_active > 0.5) {
             lin = src;
         } else {
             lin.r = (src.r <= 0.04045) ? src.r / 12.92 : pow((src.r + 0.055) / 1.055, 2.4);
@@ -231,25 +243,32 @@ void main() {
         //    target = BT.2020 if hdr_colorspace < 0.5, else DCI-P3 D65.
         //    Both matrices computed analytically from chromaticity coords
         //    (BT.2087 method; values published in BT.2087-0 §4 / ITU docs).
-        vec3 lin_remap;
-        if (hdr_colorspace < 0.5) {
-            // Rec.709 → BT.2020 (BT.2087 Annex 1)
-            mat3 M709to2020 = mat3(
-                0.6274,  0.0691,  0.0164,   // col 0 (R'-from)
-                0.3293,  0.9195,  0.0880,   // col 1 (G'-from)
-                0.0433,  0.0114,  0.8956    // col 2 (B'-from)
-            );
-            lin_remap = M709to2020 * lin;
+        vec3 lin_target;
+        if (path_b_active > 0.5) {
+            // PATH B: per-surface linearize already applied source→composite
+            // primaries matrix. Skip the matrix here.
+            lin_target = lin;
         } else {
-            // Rec.709 → DCI-P3 D65 (computed via XYZ pivot)
-            mat3 M709toP3 = mat3(
-                0.8225,  0.0331,  0.0171,
-                0.1774,  0.9669,  0.0724,
-                0.0000,  0.0000,  0.9108
-            );
-            lin_remap = M709toP3 * lin;
+            vec3 lin_remap;
+            if (hdr_colorspace < 0.5) {
+                // Rec.709 → BT.2020 (BT.2087 Annex 1)
+                mat3 M709to2020 = mat3(
+                    0.6274,  0.0691,  0.0164,   // col 0 (R'-from)
+                    0.3293,  0.9195,  0.0880,   // col 1 (G'-from)
+                    0.0433,  0.0114,  0.8956    // col 2 (B'-from)
+                );
+                lin_remap = M709to2020 * lin;
+            } else {
+                // Rec.709 → DCI-P3 D65 (computed via XYZ pivot)
+                mat3 M709toP3 = mat3(
+                    0.8225,  0.0331,  0.0171,
+                    0.1774,  0.9669,  0.0724,
+                    0.0000,  0.0000,  0.9108
+                );
+                lin_remap = M709toP3 * lin;
+            }
+            lin_target = mix(lin, lin_remap, clamp(hdr_gamut_mix, 0.0, 1.0));
         }
-        vec3 lin_target = mix(lin, lin_remap, clamp(hdr_gamut_mix, 0.0, 1.0));
 
         // 3. Optional saturation boost in linear-light luminance space.
         //    KWin and other reference HDR pipelines do NOT include a
@@ -283,8 +302,15 @@ void main() {
         //    peak. (PQ encodes absolute luminance; 1.0 in == 10000 nits out.)
         //    Floor at 250 nits — if the uniform fails to bind for any reason
         //    we'd rather surface a usable brightness instead of pitch black.
-        float ref_w = max(hdr_ref_white, 250.0);
-        vec3 hdr_lin = lin_final * (ref_w / 10000.0);
+        //
+        //    PATH B: per-surface linearize already scaled to ref_white. Skip.
+        vec3 hdr_lin;
+        if (path_b_active > 0.5) {
+            hdr_lin = lin_final;
+        } else {
+            float ref_w = max(hdr_ref_white, 250.0);
+            hdr_lin = lin_final * (ref_w / 10000.0);
+        }
 
         // 4. Inverse PQ EOTF (ST 2084) — encode linear (nits/10000) to FB val.
         const float m1 = 0.1593017578125;     // 2610/16384

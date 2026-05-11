@@ -1889,6 +1889,11 @@ where
     FullscreenPopup(CosmicWindowRenderElement<R>),
     Window(CosmicMappedRenderElement<R>),
     Backdrop(TextureRenderElement<GlesTexture>),
+    /// Path B — `ClippedSurfaceRenderElement` wrapping a WSR (typically with
+    /// no-op corner_radius) so the linearize shader runs for layer-shell,
+    /// popups, override-redirect surfaces. Used when an HDR Path B frame is
+    /// rendering; SDR paths keep using OverrideRedirect directly.
+    Linearized(crate::backend::render::clipped_surface::ClippedSurfaceRenderElement<R>),
 }
 
 impl<R> Element for WorkspaceRenderElement<R>
@@ -1903,6 +1908,7 @@ where
             WorkspaceRenderElement::FullscreenPopup(elem) => elem.id(),
             WorkspaceRenderElement::Window(elem) => elem.id(),
             WorkspaceRenderElement::Backdrop(elem) => elem.id(),
+            WorkspaceRenderElement::Linearized(elem) => elem.id(),
         }
     }
 
@@ -1913,6 +1919,7 @@ where
             WorkspaceRenderElement::FullscreenPopup(elem) => elem.current_commit(),
             WorkspaceRenderElement::Window(elem) => elem.current_commit(),
             WorkspaceRenderElement::Backdrop(elem) => elem.current_commit(),
+            WorkspaceRenderElement::Linearized(elem) => elem.current_commit(),
         }
     }
 
@@ -1923,6 +1930,7 @@ where
             WorkspaceRenderElement::FullscreenPopup(elem) => elem.src(),
             WorkspaceRenderElement::Window(elem) => elem.src(),
             WorkspaceRenderElement::Backdrop(elem) => elem.src(),
+            WorkspaceRenderElement::Linearized(elem) => elem.src(),
         }
     }
 
@@ -1933,6 +1941,7 @@ where
             WorkspaceRenderElement::FullscreenPopup(elem) => elem.geometry(scale),
             WorkspaceRenderElement::Window(elem) => elem.geometry(scale),
             WorkspaceRenderElement::Backdrop(elem) => elem.geometry(scale),
+            WorkspaceRenderElement::Linearized(elem) => elem.geometry(scale),
         }
     }
 
@@ -1943,6 +1952,7 @@ where
             WorkspaceRenderElement::FullscreenPopup(elem) => elem.location(scale),
             WorkspaceRenderElement::Window(elem) => elem.location(scale),
             WorkspaceRenderElement::Backdrop(elem) => elem.location(scale),
+            WorkspaceRenderElement::Linearized(elem) => elem.location(scale),
         }
     }
 
@@ -1953,6 +1963,7 @@ where
             WorkspaceRenderElement::FullscreenPopup(elem) => elem.transform(),
             WorkspaceRenderElement::Window(elem) => elem.transform(),
             WorkspaceRenderElement::Backdrop(elem) => elem.transform(),
+            WorkspaceRenderElement::Linearized(elem) => elem.transform(),
         }
     }
 
@@ -1967,6 +1978,7 @@ where
             WorkspaceRenderElement::FullscreenPopup(elem) => elem.damage_since(scale, commit),
             WorkspaceRenderElement::Window(elem) => elem.damage_since(scale, commit),
             WorkspaceRenderElement::Backdrop(elem) => elem.damage_since(scale, commit),
+            WorkspaceRenderElement::Linearized(elem) => elem.damage_since(scale, commit),
         }
     }
 
@@ -1977,6 +1989,7 @@ where
             WorkspaceRenderElement::FullscreenPopup(elem) => elem.opaque_regions(scale),
             WorkspaceRenderElement::Window(elem) => elem.opaque_regions(scale),
             WorkspaceRenderElement::Backdrop(elem) => elem.opaque_regions(scale),
+            WorkspaceRenderElement::Linearized(elem) => elem.opaque_regions(scale),
         }
     }
 
@@ -1987,6 +2000,7 @@ where
             WorkspaceRenderElement::FullscreenPopup(elem) => elem.alpha(),
             WorkspaceRenderElement::Window(elem) => elem.alpha(),
             WorkspaceRenderElement::Backdrop(elem) => elem.alpha(),
+            WorkspaceRenderElement::Linearized(elem) => elem.alpha(),
         }
     }
 
@@ -1997,6 +2011,7 @@ where
             WorkspaceRenderElement::FullscreenPopup(elem) => elem.kind(),
             WorkspaceRenderElement::Window(elem) => elem.kind(),
             WorkspaceRenderElement::Backdrop(elem) => elem.kind(),
+            WorkspaceRenderElement::Linearized(elem) => elem.kind(),
         }
     }
 
@@ -2007,6 +2022,7 @@ where
             WorkspaceRenderElement::FullscreenPopup(elem) => elem.is_framebuffer_effect(),
             WorkspaceRenderElement::Window(elem) => elem.is_framebuffer_effect(),
             WorkspaceRenderElement::Backdrop(elem) => elem.is_framebuffer_effect(),
+            WorkspaceRenderElement::Linearized(elem) => elem.is_framebuffer_effect(),
         }
     }
 }
@@ -2049,6 +2065,9 @@ where
                 cache,
             )
             .map_err(FromGlesError::from_gles_error),
+            WorkspaceRenderElement::Linearized(elem) => {
+                elem.draw(frame, src, dst, damage, opaque_regions, cache)
+            }
         }
     }
 
@@ -2064,6 +2083,7 @@ where
             WorkspaceRenderElement::Backdrop(elem) => {
                 elem.underlying_storage(renderer.glow_renderer_mut())
             }
+            WorkspaceRenderElement::Linearized(elem) => elem.underlying_storage(renderer),
         }
     }
 
@@ -2096,6 +2116,9 @@ where
                     cache,
                 )
                 .map_err(FromGlesError::from_gles_error)
+            }
+            WorkspaceRenderElement::Linearized(elem) => {
+                elem.capture_framebuffer(frame, src, dst, cache)
             }
         }
     }
@@ -2131,6 +2154,18 @@ where
 {
     fn from(elem: WaylandSurfaceRenderElement<R>) -> Self {
         WorkspaceRenderElement::OverrideRedirect(elem)
+    }
+}
+
+impl<R> From<crate::backend::render::clipped_surface::ClippedSurfaceRenderElement<R>>
+    for WorkspaceRenderElement<R>
+where
+    R: AsGlowRenderer,
+    R::TextureId: 'static,
+    CosmicMappedRenderElement<R>: RenderElement<R>,
+{
+    fn from(elem: crate::backend::render::clipped_surface::ClippedSurfaceRenderElement<R>) -> Self {
+        WorkspaceRenderElement::Linearized(elem)
     }
 }
 

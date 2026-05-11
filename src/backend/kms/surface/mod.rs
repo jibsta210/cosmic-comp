@@ -1310,14 +1310,32 @@ impl SurfaceThreadState {
         let res = if let Some(source_output) = source_output {
             let offscreen_output_config =
                 PostprocessOutputConfig::for_output_untransformed(source_output);
+            // Path B (COSMIC_HDR_PATH_B=1) composites in linear floating-point.
+            // The offscreen FB needs RGBA16F to hold linear HDR values without
+            // crushing the highlight headroom. SDR-only paths and the
+            // hardware-CRTC HDR path (Phase 2A.1) keep the output FB format
+            // (Abgr2101010 in HDR, Argb8888 in SDR) which is what they
+            // semantically expect.
+            let offscreen_format = if self.hdr_enabled
+                && crate::backend::render::clipped_surface::path_b_enabled()
+            {
+                Fourcc::Abgr16161616f
+            } else {
+                compositor.format()
+            };
             let postprocess_state = match self.postprocess_textures.entry(self.target_node) {
                 hash_map::Entry::Occupied(occupied) => {
                     let postprocess_state = occupied.into_mut();
-                    // If output config is different, re-create offscreen state
-                    if postprocess_state.output_config != offscreen_output_config {
+                    // If output config OR format differs, re-create.
+                    if postprocess_state.output_config != offscreen_output_config
+                        || postprocess_state
+                            .texture
+                            .format()
+                            .is_some_and(|f| f != offscreen_format)
+                    {
                         *postprocess_state = PostprocessState::new_with_renderer(
                             &mut renderer,
-                            compositor.format(),
+                            offscreen_format,
                             offscreen_output_config,
                         )?
                     }
@@ -1326,7 +1344,7 @@ impl SurfaceThreadState {
                 hash_map::Entry::Vacant(vacant) => {
                     vacant.insert(PostprocessState::new_with_renderer(
                         &mut renderer,
-                        compositor.format(),
+                        offscreen_format,
                         offscreen_output_config,
                     )?)
                 }
@@ -2235,6 +2253,16 @@ fn postprocess_elements<'a>(
                 Uniform::new("hdr_gamut_mix", hdr_gamut_mix),
                 Uniform::new("hdr_saturation", hdr_saturation),
                 Uniform::new("hdr_midtone_gamma", hdr_midtone_gamma),
+                Uniform::new(
+                    "path_b_active",
+                    if hdr_enabled
+                        && crate::backend::render::clipped_surface::path_b_enabled()
+                    {
+                        1.0_f32
+                    } else {
+                        0.0_f32
+                    },
+                ),
             ],
         ));
     }

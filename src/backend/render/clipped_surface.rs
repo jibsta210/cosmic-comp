@@ -70,6 +70,22 @@ pub mod tf {
 // ---------------------------------------------------------------------------
 
 use std::cell::Cell;
+use std::sync::OnceLock;
+
+/// Read once at process startup: `COSMIC_HDR_PATH_B=1` enables Path B (scene-
+/// linear compositing + per-surface linearize + linear-input postprocess
+/// shader). Default off, falls back to Phase 2A.2 hardware-CRTC behavior.
+///
+/// Opt-in so we can A/B test Path B against the existing hardware path without
+/// committing the system to one or the other.
+pub fn path_b_enabled() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("COSMIC_HDR_PATH_B")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE"))
+            .unwrap_or(false)
+    })
+}
 
 thread_local! {
     /// `Some((true, ref_white_nits))` when the current rendering thread is in
@@ -106,6 +122,54 @@ pub fn render_hdr_active() -> bool {
     current_hdr_context().is_some_and(|(enabled, _)| enabled)
 }
 
+/// Convert an sRGB-encoded RGB color into the Path B linear composite space.
+///
+/// When Path B is active in an HDR frame, non-surface shader elements
+/// (IndicatorShader, BackdropShader, etc.) write their colors directly to the
+/// linear RGBA16F offscreen. If those colors stay sRGB-encoded, the postprocess
+/// shader (which skips its sRGB-decode step in Path B mode) interprets them as
+/// linear and the panel sees catastrophically wrong values (e.g. 0.5 sRGB
+/// gray becoming 5,000 cd/m² HDR).
+///
+/// Call this helper on every color before passing as a shader uniform so the
+/// values match the surface-side linearize output. Outside Path B / HDR, it's
+/// a passthrough.
+pub fn linearize_srgb_color_for_path_b(color: [f32; 3]) -> [f32; 3] {
+    if !path_b_enabled() {
+        return color;
+    }
+    let Some((true, ref_white_nits)) = current_hdr_context() else {
+        return color;
+    };
+
+    // sRGB inverse EOTF (piecewise: linear segment + gamma 2.4 curve). Same
+    // math as clipped_surface.frag's `decode_srgb`.
+    let srgb_decode = |c: f32| -> f32 {
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let lin = [srgb_decode(color[0]), srgb_decode(color[1]), srgb_decode(color[2])];
+
+    // BT.709 → BT.2020 (BT.2087 Annex 1). Same matrix as in offscreen.frag
+    // M709to2020 and in clipped_surface.rs's BT709_TO_BT2020 (transposed for
+    // row-major matrix * column-vector application here).
+    let bt2020 = [
+        0.6274 * lin[0] + 0.3293 * lin[1] + 0.0433 * lin[2],
+        0.0691 * lin[0] + 0.9195 * lin[1] + 0.0114 * lin[2],
+        0.0164 * lin[0] + 0.0880 * lin[1] + 0.8956 * lin[2],
+    ];
+
+    let ref_white_scale = (ref_white_nits as f32) / 10000.0;
+    [
+        bt2020[0] * ref_white_scale,
+        bt2020[1] * ref_white_scale,
+        bt2020[2] * ref_white_scale,
+    ]
+}
+
 /// Read the current HDR render context. Returns `None` if not in an HDR frame
 /// (or if no context has been set — i.e. existing non-HDR render paths).
 fn current_hdr_context() -> Option<(bool, u32)> {
@@ -115,25 +179,22 @@ fn current_hdr_context() -> Option<(bool, u32)> {
 impl ColorTransform {
     /// Pick the appropriate color transform for the current render frame.
     ///
-    /// **Currently always returns passthrough** even in HDR mode. The
-    /// infrastructure (extended shader, thread-local, wrapping in window.rs /
-    /// stack.rs) is in place but the linearize stage is held inactive until
-    /// chunks 1 + 3 (RGBA16F offscreen + linear-input postprocess shader)
-    /// land — otherwise the linear values produced by linearize would be
-    /// crushed by Abgr2101010's 10-bit precision AND the existing postprocess
-    /// shader would double-decode them, producing visibly wrong colors in HDR
-    /// mode.
+    /// HDR frame + Path B enabled → real linearize transform (sRGB→linear→
+    /// BT.709→BT.2020 matrix→ref_white scale). Default surface description
+    /// is sRGB; future enhancement reads the surface's actual
+    /// `wp_color_management_v1` description via `with_surface_image_description`
+    /// (would need the WlSurface handle threaded to here, which requires
+    /// modifying WaylandSurfaceRenderElement upstream).
     ///
-    /// To activate Path B fully: change this match to dispatch
-    /// `Self::for_surface(None, true, ref_white_nits)` for HDR frames AND
-    /// land the offscreen FB swap + postprocess shader update in the same
-    /// commit so the pipeline stays consistent.
+    /// Otherwise → passthrough (existing pre-Path-B behavior preserved).
     pub fn for_current_frame() -> Self {
-        // Defensive: read the context so the thread-local set / clear path is
-        // still exercised (catches threading bugs early), but ignore its
-        // value for now.
-        let _ = current_hdr_context();
-        Self::passthrough()
+        if !path_b_enabled() {
+            return Self::passthrough();
+        }
+        match current_hdr_context() {
+            Some((true, ref_white_nits)) => Self::for_surface(None, true, ref_white_nits),
+            _ => Self::passthrough(),
+        }
     }
 
     /// Identity transform — shader skips the linearize block, behavior matches
