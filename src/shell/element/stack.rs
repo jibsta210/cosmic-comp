@@ -2028,6 +2028,18 @@ where
             CosmicStackRenderElement::Clipped(elem) => elem.is_framebuffer_effect(),
         }
     }
+
+    fn allow_direct_scanout(&self) -> bool {
+        match self {
+            CosmicStackRenderElement::Header(elem) => elem.allow_direct_scanout(),
+            CosmicStackRenderElement::Shadow(elem) => elem.allow_direct_scanout(),
+            CosmicStackRenderElement::Border(elem) => elem.allow_direct_scanout(),
+            CosmicStackRenderElement::Window(elem) => elem.allow_direct_scanout(),
+            // Phase 3.3: Clipped variant returns false when the shader is
+            // doing per-surface linearize work (Path B) or corner clipping.
+            CosmicStackRenderElement::Clipped(elem) => elem.allow_direct_scanout(),
+        }
+    }
 }
 
 impl<R> RenderElement<R> for CosmicStackRenderElement<R>

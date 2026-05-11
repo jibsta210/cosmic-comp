@@ -1321,6 +1321,25 @@ where
             CosmicMappedRenderElement::Egui(elem) => elem.is_framebuffer_effect(),
         }
     }
+
+    fn allow_direct_scanout(&self) -> bool {
+        match self {
+            CosmicMappedRenderElement::Stack(elem) => elem.allow_direct_scanout(),
+            CosmicMappedRenderElement::Window(elem) => elem.allow_direct_scanout(),
+            CosmicMappedRenderElement::TiledStack(elem) => elem.allow_direct_scanout(),
+            CosmicMappedRenderElement::TiledWindow(elem) => elem.allow_direct_scanout(),
+            CosmicMappedRenderElement::TiledOverlay(elem) => elem.allow_direct_scanout(),
+            CosmicMappedRenderElement::MovingStack(elem) => elem.allow_direct_scanout(),
+            CosmicMappedRenderElement::MovingWindow(elem) => elem.allow_direct_scanout(),
+            CosmicMappedRenderElement::GrabbedStack(elem) => elem.allow_direct_scanout(),
+            CosmicMappedRenderElement::GrabbedWindow(elem) => elem.allow_direct_scanout(),
+            CosmicMappedRenderElement::FocusIndicator(elem) => elem.allow_direct_scanout(),
+            CosmicMappedRenderElement::Overlay(elem) => elem.allow_direct_scanout(),
+            CosmicMappedRenderElement::StackHoverIndicator(elem) => elem.allow_direct_scanout(),
+            #[cfg(feature = "debug")]
+            CosmicMappedRenderElement::Egui(elem) => elem.allow_direct_scanout(),
+        }
+    }
 }
 
 impl<R> RenderElement<R> for CosmicMappedRenderElement<R>

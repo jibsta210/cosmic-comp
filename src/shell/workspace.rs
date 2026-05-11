@@ -2025,6 +2025,20 @@ where
             WorkspaceRenderElement::Linearized(elem) => elem.is_framebuffer_effect(),
         }
     }
+
+    fn allow_direct_scanout(&self) -> bool {
+        match self {
+            WorkspaceRenderElement::OverrideRedirect(elem) => elem.allow_direct_scanout(),
+            WorkspaceRenderElement::Fullscreen(elem) => elem.allow_direct_scanout(),
+            WorkspaceRenderElement::FullscreenPopup(elem) => elem.allow_direct_scanout(),
+            WorkspaceRenderElement::Window(elem) => elem.allow_direct_scanout(),
+            WorkspaceRenderElement::Backdrop(elem) => elem.allow_direct_scanout(),
+            // Linearized = ClippedSurfaceRenderElement with Path B color
+            // transform active. Its own impl returns false when the shader
+            // is doing real work; forwards inner's answer when passthrough.
+            WorkspaceRenderElement::Linearized(elem) => elem.allow_direct_scanout(),
+        }
+    }
 }
 
 impl<R> RenderElement<R> for WorkspaceRenderElement<R>

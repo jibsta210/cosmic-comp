@@ -1413,6 +1413,19 @@ where
             CosmicWindowRenderElement::Clipped(elem) => elem.is_framebuffer_effect(),
         }
     }
+
+    fn allow_direct_scanout(&self) -> bool {
+        match self {
+            CosmicWindowRenderElement::Header(elem) => elem.allow_direct_scanout(),
+            CosmicWindowRenderElement::Shadow(elem) => elem.allow_direct_scanout(),
+            CosmicWindowRenderElement::Border(elem) => elem.allow_direct_scanout(),
+            CosmicWindowRenderElement::Window(elem) => elem.allow_direct_scanout(),
+            // Phase 3.3: Clipped variant returns false when the shader is
+            // doing per-surface linearize work (Path B) or corner clipping —
+            // see ClippedSurfaceRenderElement::allow_direct_scanout.
+            CosmicWindowRenderElement::Clipped(elem) => elem.allow_direct_scanout(),
+        }
+    }
 }
 
 impl<R> RenderElement<R> for CosmicWindowRenderElement<R>

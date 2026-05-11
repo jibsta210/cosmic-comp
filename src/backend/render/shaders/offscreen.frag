@@ -290,9 +290,26 @@ void main() {
         //     = no lift (colorimetric). 0.6-0.8 makes desktop content look
         //     "punchy HDR-like." The trick: compute Y, gamma-curve it, scale
         //     RGB by the ratio so chroma is preserved.
+        //
+        //     In Path B, the midtone lift would also distort real HDR content
+        //     (PQ video from Firefox/mpv that's already at correct absolute
+        //     luminance). Fade the gamma effect out smoothly as Y crosses
+        //     ref_white — pixels above ~ref_white are presumed-HDR and
+        //     should not be lifted further. Below ref_white, full gamma
+        //     applies (lifts SDR midtones). The crossover band is
+        //     [ref_white_scale, 2*ref_white_scale] in Path B.
         float gamma = (hdr_midtone_gamma < 0.1) ? 1.0 : hdr_midtone_gamma;
         float Y_orig = dot(lin_target, vec3(0.2627, 0.6780, 0.0593));
-        float Y_new = pow(max(Y_orig, 0.0), gamma);
+        float gamma_eff = gamma;
+        if (path_b_active > 0.5) {
+            // ref_white in linear Path B units. hdr_ref_white is in nits;
+            // /10000 brings to PQ-aligned linear scale (= what the per-surface
+            // linearize stage scaled SDR-1.0 to).
+            float sdr_white = max(hdr_ref_white, 1.0) / 10000.0;
+            float fade = clamp((Y_orig - sdr_white) / sdr_white, 0.0, 1.0);
+            gamma_eff = mix(gamma, 1.0, fade);
+        }
+        float Y_new = pow(max(Y_orig, 0.0), gamma_eff);
         float lift_scale = (Y_orig > 0.0001) ? (Y_new / Y_orig) : 1.0;
         vec3 lin_lifted = lin_target * lift_scale;
 

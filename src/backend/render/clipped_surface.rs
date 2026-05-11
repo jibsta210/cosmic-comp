@@ -349,6 +349,17 @@ where
     radius: [u8; 4],
     geometry: Rectangle<f64, Logical>,
     uniforms: Vec<Uniform<'static>>,
+    /// True when neither corner clipping nor color transform is active for
+    /// this element — i.e. it's a "wrapped passthrough" we only used because
+    /// `wrap_for_path_b` blindly wraps every WSR. In that case the element
+    /// behaves identically to its inner `WaylandSurfaceRenderElement` and is
+    /// safe to direct-scanout (gates Phase 3.3).
+    ///
+    /// False whenever the shader is doing real work — non-zero corner radius
+    /// OR a non-passthrough color transform (e.g. Path B's linearize). DS
+    /// would skip the shader and produce wrong output (sharp corners, no
+    /// linearize) so we reject those.
+    allow_ds: bool,
 }
 
 impl<R> ClippedSurfaceRenderElement<R>
@@ -486,12 +497,23 @@ where
             ),
         ];
 
+        // Direct-scanout eligibility: the element is a real wrap (shader doing
+        // work) when EITHER the corner radius is non-zero OR the color
+        // transform is non-passthrough. In either case the GPU shader produces
+        // pixels the hardware planes can't reproduce by themselves, so DS
+        // would silently skip the work and show wrong output. Only when both
+        // are inert can we hand the surface to a plane verbatim.
+        let no_clip = radius == [0u8; 4];
+        let no_color = color.tf_id == tf::PASSTHROUGH;
+        let allow_ds = no_clip && no_color;
+
         Self {
             inner: elem,
             program: ClippingShader::get(renderer),
             radius,
             geometry,
             uniforms,
+            allow_ds,
         }
     }
 
@@ -612,6 +634,16 @@ where
 
     fn kind(&self) -> Kind {
         self.inner.kind()
+    }
+
+    /// Direct-scanout safety: only allow when the shader is functionally
+    /// inert (no corner clipping AND passthrough color transform). When
+    /// either is active, the per-surface shader work is required to produce
+    /// correct pixels — handing the surface to a hardware plane would skip
+    /// that work and display the raw buffer, breaking Path B's linearize
+    /// and/or rounded corners.
+    fn allow_direct_scanout(&self) -> bool {
+        self.allow_ds && self.inner.allow_direct_scanout()
     }
 }
 
