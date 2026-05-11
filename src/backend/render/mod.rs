@@ -16,7 +16,6 @@ use crate::{
         kms::render::gles::GbmGlowBackend,
         render::{
             clipped_surface::{CLIPPING_SHADER, ClippingShader},
-            linearize::{LINEARIZE_SHADER, LinearizeShader},
             element::DamageElement,
             shadow::{SHADOW_SHADER, ShadowShader},
         },
@@ -83,7 +82,6 @@ use smithay_egui::EguiState;
 
 pub mod animations;
 pub mod clipped_surface;
-pub mod linearize;
 pub mod cursor;
 pub mod element;
 pub mod hw_color_pipeline;
@@ -429,22 +427,19 @@ pub fn init_shaders(renderer: &mut GlesRenderer) -> Result<(), GlesError> {
             UniformName::new("hdr_midtone_gamma", UniformType::_1f),
         ],
     )?;
+    // Path B core — the clipping shader was extended (in clipped_surface.frag)
+    // to subsume linearize (inverse-EOTF + primaries matrix + SDR ref_white
+    // scaling) when `tf_id != 0`. Existing clipping-only callers pass tf_id=0
+    // and behave identically; HDR-aware callers pass real values to get
+    // per-surface linearization into the composite color space.
     let clipping_shader = renderer.compile_custom_texture_shader(
         CLIPPING_SHADER,
         &[
             UniformName::new("geo_size", UniformType::_2f),
             UniformName::new("corner_radius", UniformType::_4f),
             UniformName::new("input_to_geo", UniformType::Matrix3x3),
-        ],
-    )?;
-    // Path B chunk 2 — per-surface decode-to-linear shader. Each Linearized
-    // surface element installs this with its own uniforms (tf_id selecting the
-    // inverse transfer function, primaries_matrix mapping source primaries to
-    // the composite color space, ref_white_scale aligning SDR reference white
-    // with the PQ-absolute luminance scale).
-    let linearize_shader = renderer.compile_custom_texture_shader(
-        LINEARIZE_SHADER,
-        &[
+            // Path B linearize uniforms — defaults (tf_id=0, identity matrix,
+            // scale=1.0) are passthrough.
             UniformName::new("tf_id", UniformType::_1i),
             UniformName::new("ref_white_scale", UniformType::_1f),
             UniformName::new("primaries_matrix", UniformType::Matrix3x3),
@@ -477,9 +472,6 @@ pub fn init_shaders(renderer: &mut GlesRenderer) -> Result<(), GlesError> {
     egl_context
         .user_data()
         .insert_if_missing(|| ClippingShader(clipping_shader));
-    egl_context
-        .user_data()
-        .insert_if_missing(|| LinearizeShader(linearize_shader));
     egl_context
         .user_data()
         .insert_if_missing(|| ShadowShader(shadow_shader));

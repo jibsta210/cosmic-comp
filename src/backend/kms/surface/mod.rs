@@ -1217,6 +1217,17 @@ impl SurfaceThreadState {
             vrr = has_active_fullscreen;
         }
 
+        // Path B — install the HDR render context so every
+        // ClippedSurfaceRenderElement constructed during output_elements
+        // automatically picks up the linearize transform (sRGB→linear→BT.2020
+        // matrix→ref_white scale). Cleared at the end of render_frame.
+        if self.hdr_enabled {
+            crate::backend::render::clipped_surface::set_render_hdr_context(
+                true,
+                self.hdr_ref_white as u32,
+            );
+        }
+
         let mut elements = output_elements(
             Some(&render_node),
             &mut renderer,
@@ -1230,6 +1241,7 @@ impl SurfaceThreadState {
             Some((&self.egui, &self.timings)),
         )
         .map_err(|err| {
+            crate::backend::render::clipped_surface::clear_render_hdr_context();
             anyhow::format_err!("Failed to accumulate elements for rendering: {:?}", err)
         })?;
 
@@ -1521,6 +1533,8 @@ impl SurfaceThreadState {
                     .difference(remove_frame_flags),
             )
         };
+        // Path B — clear the HDR render context now that rendering is done.
+        crate::backend::render::clipped_surface::clear_render_hdr_context();
         self.timings.draw_done(&self.clock);
 
         match res {

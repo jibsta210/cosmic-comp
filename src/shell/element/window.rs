@@ -551,12 +551,26 @@ impl CosmicWindow {
                 radii[1] = 0;
                 radii[3] = 0;
             }
-            if radii.iter().any(|x| *x != 0)
+            let needs_clipping = radii.iter().any(|x| *x != 0)
                 && clip
-                && ClippedSurfaceRenderElement::will_clip(&elem, scale, geo, radii)
-            {
+                && ClippedSurfaceRenderElement::will_clip(&elem, scale, geo, radii);
+            // Path B — when an HDR render frame is active, ALL surfaces go
+            // through ClippedSurfaceRenderElement so they get linearized
+            // (per-surface decode-to-linear via the extended clipping shader)
+            // before composition. Non-clipped surfaces in HDR mode get
+            // corner_radius=[0; 4] which makes the shader's clipping pass a
+            // no-op.
+            let needs_linearize = crate::backend::render::clipped_surface::render_hdr_active();
+            if needs_clipping || needs_linearize {
+                let (clip_radii, clip_geo) = if needs_clipping {
+                    (radii, geo)
+                } else {
+                    // Non-clipped surface in HDR mode — feed the shader values
+                    // that produce a no-op clip pass.
+                    ([0u8; 4], elem.geometry(scale).to_f64().to_logical(scale))
+                };
                 CosmicWindowRenderElement::Clipped(ClippedSurfaceRenderElement::new(
-                    renderer, elem, scale, geo, radii,
+                    renderer, elem, scale, clip_geo, clip_radii,
                 ))
             } else {
                 CosmicWindowRenderElement::Window(elem)

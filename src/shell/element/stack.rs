@@ -817,15 +817,23 @@ impl CosmicStack {
                     .into_iter()
                     .map(move |elem| {
                         let radii = radii.map(|[a, _, c, _]| [a, 0, c, 0]);
-                        if radii.is_some_and(|radii| {
+                        let needs_clipping = radii.is_some_and(|radii| {
                             ClippedSurfaceRenderElement::will_clip(&elem, scale, geo, radii)
-                        }) {
+                        });
+                        // Path B — see window.rs for the matching pattern.
+                        let needs_linearize =
+                            crate::backend::render::clipped_surface::render_hdr_active();
+                        if needs_clipping || needs_linearize {
+                            let (clip_radii, clip_geo) = if needs_clipping {
+                                (radii.unwrap(), geo)
+                            } else {
+                                (
+                                    [0u8; 4],
+                                    elem.geometry(scale).to_f64().to_logical(scale),
+                                )
+                            };
                             CosmicStackRenderElement::Clipped(ClippedSurfaceRenderElement::new(
-                                renderer,
-                                elem,
-                                scale,
-                                geo,
-                                radii.unwrap(),
+                                renderer, elem, scale, clip_geo, clip_radii,
                             ))
                         } else {
                             CosmicStackRenderElement::Window(elem)
