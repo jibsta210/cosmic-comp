@@ -16,6 +16,7 @@ use crate::{
         kms::render::gles::GbmGlowBackend,
         render::{
             clipped_surface::{CLIPPING_SHADER, ClippingShader},
+            linearize::{LINEARIZE_SHADER, LinearizeShader},
             element::DamageElement,
             shadow::{SHADOW_SHADER, ShadowShader},
         },
@@ -82,6 +83,7 @@ use smithay_egui::EguiState;
 
 pub mod animations;
 pub mod clipped_surface;
+pub mod linearize;
 pub mod cursor;
 pub mod element;
 pub mod hw_color_pipeline;
@@ -435,6 +437,19 @@ pub fn init_shaders(renderer: &mut GlesRenderer) -> Result<(), GlesError> {
             UniformName::new("input_to_geo", UniformType::Matrix3x3),
         ],
     )?;
+    // Path B chunk 2 — per-surface decode-to-linear shader. Each Linearized
+    // surface element installs this with its own uniforms (tf_id selecting the
+    // inverse transfer function, primaries_matrix mapping source primaries to
+    // the composite color space, ref_white_scale aligning SDR reference white
+    // with the PQ-absolute luminance scale).
+    let linearize_shader = renderer.compile_custom_texture_shader(
+        LINEARIZE_SHADER,
+        &[
+            UniformName::new("tf_id", UniformType::_1i),
+            UniformName::new("ref_white_scale", UniformType::_1f),
+            UniformName::new("primaries_matrix", UniformType::Matrix3x3),
+        ],
+    )?;
     let shadow_shader = renderer.compile_custom_pixel_shader(
         SHADOW_SHADER,
         &[
@@ -462,6 +477,9 @@ pub fn init_shaders(renderer: &mut GlesRenderer) -> Result<(), GlesError> {
     egl_context
         .user_data()
         .insert_if_missing(|| ClippingShader(clipping_shader));
+    egl_context
+        .user_data()
+        .insert_if_missing(|| LinearizeShader(linearize_shader));
     egl_context
         .user_data()
         .insert_if_missing(|| ShadowShader(shadow_shader));
