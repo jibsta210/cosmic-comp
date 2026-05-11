@@ -198,23 +198,28 @@ void main() {
             //   Bot-left  : 500 nits gray
             //   Bot-right : 200 nits saturated R / G / B vertical bars
             // Each region writes the linear-light value the rest of the
-            // pipeline expects (sRGB-encoded values that linearize to the
-            // matching nits/hdr_ref_white). Bars give a saturation reference;
-            // grays give a luminance ramp reference.
+            // pipeline expects:
+            //   - Phase 2A.2 (path_b_active=0): write `nits / ref_w` so
+            //     that the ref_white_scale stage below (multiply by
+            //     ref_w/10000) brings it to absolute `nits/10000`, which
+            //     PQ-encodes to the target luminance.
+            //   - Path B (path_b_active=1): the ref_white_scale stage is
+            //     skipped, so write directly in `nits / 10000` units so
+            //     PQ encode produces the matching absolute luminance.
             float u = v_coords.x;
             float v = v_coords.y;
-            float ref_w = max(hdr_ref_white, 1.0);
+            float divisor = (path_b_active > 0.5) ? 10000.0 : max(hdr_ref_white, 1.0);
             if (u < 0.5 && v < 0.5) {
-                float frac = 100.0 / ref_w;
+                float frac = 100.0 / divisor;
                 src = vec3(frac, frac, frac);
             } else if (u >= 0.5 && v < 0.5) {
-                float frac = 300.0 / ref_w;
+                float frac = 300.0 / divisor;
                 src = vec3(frac, frac, frac);
             } else if (u < 0.5 && v >= 0.5) {
-                float frac = 500.0 / ref_w;
+                float frac = 500.0 / divisor;
                 src = vec3(frac, frac, frac);
             } else {
-                float frac = 200.0 / ref_w;
+                float frac = 200.0 / divisor;
                 if (u < 0.6667) {
                     src = vec3(frac, 0.0, 0.0);
                 } else if (u < 0.8333) {

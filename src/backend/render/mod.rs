@@ -671,10 +671,18 @@ pub enum ElementFilter {
 /// render arms — surfaces that don't otherwise go through cosmic-mapped
 /// element render (which has its own HDR wrap path in
 /// shell/element/{window,stack}.rs).
+///
+/// `source_surface` is the WlSurface the WSRs were derived from (the root
+/// of the surface tree given to `render_elements_from_surface_tree`). When
+/// passed, the shader reads that surface's `wp_color_management_v1`
+/// description to pick the correct transfer function + primaries. Pass
+/// `None` only when the surface isn't available (caller doesn't have it
+/// in scope) — falls back to the sRGB default.
 fn wrap_for_path_b<R>(
     renderer: &mut R,
     wsrs: Vec<smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement<R>>,
     scale: Scale<f64>,
+    source_surface: Option<&smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
 ) -> Vec<WorkspaceRenderElement<R>>
 where
     R: AsGlowRenderer + smithay::backend::renderer::ImportAll + smithay::backend::renderer::ImportMem,
@@ -688,11 +696,16 @@ where
             if active {
                 use smithay::backend::renderer::element::Element;
                 let elem_geo = wsr.geometry(scale).to_f64().to_logical(scale);
-                WorkspaceRenderElement::Linearized(
+                let clipped = if let Some(surface) = source_surface {
+                    crate::backend::render::clipped_surface::ClippedSurfaceRenderElement::new_for_surface(
+                        renderer, wsr, scale, elem_geo, [0u8; 4], surface,
+                    )
+                } else {
                     crate::backend::render::clipped_surface::ClippedSurfaceRenderElement::new(
                         renderer, wsr, scale, elem_geo, [0u8; 4],
-                    ),
-                )
+                    )
+                };
+                WorkspaceRenderElement::Linearized(clipped)
             } else {
                 WorkspaceRenderElement::OverrideRedirect(wsr)
             }
@@ -926,9 +939,10 @@ where
             Stage::LayerPopup {
                 popup, location, ..
             } => {
+                let popup_surface = popup.wl_surface();
                 let wsrs = render_elements_from_surface_tree::<_, WaylandSurfaceRenderElement<_>>(
                     renderer,
-                    popup.wl_surface(),
+                    popup_surface,
                     location
                         .to_local(output)
                         .as_logical()
@@ -938,16 +952,17 @@ where
                     FRAME_TIME_FILTER,
                 );
                 elements.extend(
-                    wrap_for_path_b(renderer, wsrs, Scale::from(scale))
+                    wrap_for_path_b(renderer, wsrs, Scale::from(scale), Some(popup_surface))
                         .into_iter()
                         .flat_map(crop_to_output)
                         .map(Into::into),
                 );
             }
             Stage::LayerSurface { layer, location } => {
+                let layer_surface = layer.wl_surface();
                 let wsrs = render_elements_from_surface_tree::<_, WaylandSurfaceRenderElement<_>>(
                     renderer,
-                    layer.wl_surface(),
+                    layer_surface,
                     location
                         .to_local(output)
                         .as_logical()
@@ -957,7 +972,7 @@ where
                     FRAME_TIME_FILTER,
                 );
                 elements.extend(
-                    wrap_for_path_b(renderer, wsrs, Scale::from(scale))
+                    wrap_for_path_b(renderer, wsrs, Scale::from(scale), Some(layer_surface))
                         .into_iter()
                         .flat_map(crop_to_output)
                         .map(Into::into),
@@ -980,7 +995,11 @@ where
                         FRAME_TIME_FILTER,
                     );
                     elements.extend(
-                        wrap_for_path_b(renderer, wsrs, Scale::from(scale))
+                        // OR surfaces are typically X11 windows which can't
+                        // speak wp_color_management_v1, but pass the surface
+                        // anyway — it's free and future-proofs against rare
+                        // OR-with-CM scenarios.
+                        wrap_for_path_b(renderer, wsrs, Scale::from(scale), Some(&surface))
                             .into_iter()
                             .flat_map(crop_to_output)
                             .map(Into::into),
