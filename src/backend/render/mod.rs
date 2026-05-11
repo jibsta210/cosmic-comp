@@ -123,6 +123,11 @@ pub static CLEAR_COLOR: Color32F = Color32F::new(0.153, 0.161, 0.165, 1.0);
 pub static OUTLINE_SHADER: &str = include_str!("./shaders/rounded_outline.frag");
 pub static RECTANGLE_SHADER: &str = include_str!("./shaders/rounded_rectangle.frag");
 pub static POSTPROCESS_SHADER: &str = include_str!("./shaders/offscreen.frag");
+// Path B screencopy tone-down: RGBA16F linear-BT.2020-refwhite → sRGB
+// Argb8888. Single-pass shader invoked by send_screencopy_result when the
+// pre-postprocess texture is RGBA16F and the client wants sRGB. See
+// shaders/screencopy_sdr.frag for the math.
+pub static SCREENCOPY_SDR_SHADER: &str = include_str!("./shaders/screencopy_sdr.frag");
 pub static GROUP_COLOR: [f32; 3] = [0.788, 0.788, 0.788];
 pub static ACTIVE_GROUP_COLOR: [f32; 3] = [0.58, 0.922, 0.922];
 
@@ -392,12 +397,16 @@ impl BackdropShader {
 
 pub struct PostprocessShader(pub GlesTexProgram);
 
+// Path B screencopy tone-down shader handle. See SCREENCOPY_SDR_SHADER.
+pub struct ScreencopySdrShader(pub GlesTexProgram);
+
 pub fn init_shaders(renderer: &mut GlesRenderer) -> Result<(), GlesError> {
     {
         let egl_context = renderer.egl_context();
         if egl_context.user_data().get::<IndicatorShader>().is_some()
             && egl_context.user_data().get::<BackdropShader>().is_some()
             && egl_context.user_data().get::<PostprocessShader>().is_some()
+            && egl_context.user_data().get::<ScreencopySdrShader>().is_some()
         {
             return Ok(());
         }
@@ -458,6 +467,14 @@ pub fn init_shaders(renderer: &mut GlesRenderer) -> Result<(), GlesError> {
             UniformName::new("primaries_matrix", UniformType::Matrix3x3),
         ],
     )?;
+    // Path B screencopy tone-down. Single uniform: `ref_white_scale` which
+    // is the same `ref_white_nits / 10000.0` value the per-surface linearize
+    // baked into the offscreen texture. Used by send_screencopy_result for
+    // RGBA16F → sRGB Argb8888 conversion in Path B.
+    let screencopy_sdr_shader = renderer.compile_custom_texture_shader(
+        SCREENCOPY_SDR_SHADER,
+        &[UniformName::new("ref_white_scale", UniformType::_1f)],
+    )?;
     let shadow_shader = renderer.compile_custom_pixel_shader(
         SHADOW_SHADER,
         &[
@@ -482,6 +499,9 @@ pub fn init_shaders(renderer: &mut GlesRenderer) -> Result<(), GlesError> {
     egl_context
         .user_data()
         .insert_if_missing(|| PostprocessShader(postprocess_shader));
+    egl_context
+        .user_data()
+        .insert_if_missing(|| ScreencopySdrShader(screencopy_sdr_shader));
     egl_context
         .user_data()
         .insert_if_missing(|| ClippingShader(clipping_shader));

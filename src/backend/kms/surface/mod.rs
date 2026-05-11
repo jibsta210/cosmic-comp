@@ -3,8 +3,8 @@
 use crate::{
     backend::render::{
         CLEAR_COLOR, CursorMode, GlMultiError, GlMultiRenderer, PostprocessOutputConfig,
-        PostprocessShader, PostprocessState,
-        element::{CosmicElement, DamageElement},
+        PostprocessShader, PostprocessState, ScreencopySdrShader,
+        element::{AsGlowRenderer, CosmicElement, DamageElement},
         init_shaders, output_elements,
     },
     config::ScreenFilter,
@@ -1611,6 +1611,16 @@ impl SurfaceThreadState {
                                 &elements,
                                 (&session, frame, res),
                                 now.into(),
+                                // Path B tone-down needs ref_white to undo
+                                // the per-surface scaling. 0 disables the
+                                // shader path (for hardware HDR + SDR).
+                                if self.hdr_enabled
+                                    && crate::backend::render::clipped_surface::path_b_enabled()
+                                {
+                                    self.hdr_ref_white
+                                } else {
+                                    0.0
+                                },
                             ) {
                                 tracing::warn!(?err, "Failed to screencopy");
                             }
@@ -1953,6 +1963,11 @@ fn send_screencopy_result<'a>(
         Result<(Option<Vec<Rectangle<i32, Physical>>>, RenderElementStates), OutputNoMode>,
     ),
     presentation_time: Duration,
+    // Path B: the per-surface linearize stage in clipped_surface.frag bakes
+    // `ref_white_nits / 10000.0` into the offscreen RGBA16F texture. We need
+    // the inverse of this scale to tone-down to sRGB for screencopy clients.
+    // Pass the live ref_white_nits value — 0 if not in Path B.
+    hdr_ref_white_for_path_b: f32,
 ) -> Result<()> {
     let (damage, _) = res?;
 
@@ -2036,6 +2051,124 @@ fn send_screencopy_result<'a>(
             .collect::<Vec<_>>();
 
         if let Some(tex) = pre_postprocess_data.texture.as_mut() {
+            // Path B: the pre-postprocess texture is RGBA16F linear-BT.2020
+            // with `ref_white_nits / 10000.0` scaling baked in. Raw blit to
+            // sRGB ARGB8888 produces a washed/broken screenshot — the bytes
+            // would be reinterpreted as sRGB. Instead, render the texture
+            // through screencopy_sdr_shader which inverts the linearize
+            // pipeline: undo ref_white scale → BT.2020→BT.709 matrix →
+            // linear→sRGB encode.
+            let path_b_tonedown = hdr_ref_white_for_path_b > 0.0
+                && matches!(tex.format(), Some(Fourcc::Abgr16161616f));
+
+            if path_b_tonedown {
+                if let Some(fb) = fb.as_mut() {
+                    let shader = renderer
+                        .glow_renderer_mut()
+                        .egl_context()
+                        .user_data()
+                        .get::<ScreencopySdrShader>()
+                        .expect(
+                            "ScreencopySdrShader should be installed by init_shaders",
+                        )
+                        .0
+                        .clone();
+                    let ref_white_scale = hdr_ref_white_for_path_b / 10000.0;
+                    let tex_size_buffer = tex
+                        .size()
+                        .to_logical(1, Transform::Normal)
+                        .to_buffer(1, Transform::Normal)
+                        .to_f64();
+                    let src_rect = Rectangle::new(Point::from((0., 0.)), tex_size_buffer);
+                    let dst_rect = Rectangle::from_size(output_size);
+                    let tex_clone = tex.clone();
+                    let mut frame =
+                        renderer.render(fb, output_size, output_transform).map_err(
+                            RenderError::<<GlMultiRenderer as RendererSuper>::Error>::Rendering,
+                        )?;
+                    BorrowMut::<smithay::backend::renderer::gles::GlesFrame>::borrow_mut(
+                        <GlMultiRenderer as AsGlowRenderer>::glow_frame_mut(&mut frame),
+                    )
+                    .override_default_tex_program(
+                        shader,
+                        vec![Uniform::new("ref_white_scale", ref_white_scale)],
+                    );
+                    frame
+                        .as_mut()
+                        .render_texture_from_to(
+                            &tex_clone,
+                            src_rect,
+                            dst_rect,
+                            &adjusted,
+                            &[dst_rect],
+                            Transform::Normal,
+                            1.0,
+                        )
+                        .map_err(GlMultiError::Render)
+                        .map_err(
+                            RenderError::<<GlMultiRenderer as RendererSuper>::Error>::Rendering,
+                        )?;
+                    BorrowMut::<smithay::backend::renderer::gles::GlesFrame>::borrow_mut(
+                        <GlMultiRenderer as AsGlowRenderer>::glow_frame_mut(&mut frame),
+                    )
+                    .clear_tex_program_override();
+                    sync = frame.finish().map_err(
+                        RenderError::<<GlMultiRenderer as RendererSuper>::Error>::Rendering,
+                    )?;
+                    renderer.wait(&sync).map_err(
+                        RenderError::<<GlMultiRenderer as RendererSuper>::Error>::Rendering,
+                    )?;
+                }
+                // Cursor compositing on top of tone-downed buffer.
+                if let Some(fb) = fb.as_mut() {
+                    if let Some(cursor_geometry) = pre_postprocess_data
+                        .cursor_geometry
+                        .as_ref()
+                        .filter(|_| session.draw_cursor())
+                    {
+                        let cursor_damage = adjusted
+                            .iter()
+                            .filter_map(|rect| cursor_geometry.intersection(*rect))
+                            .map(|rect| {
+                                Rectangle::new(rect.loc - cursor_geometry.loc, rect.size)
+                            })
+                            .collect::<Vec<_>>();
+                        let mut frame = renderer
+                            .render(fb, output_size, output_transform)
+                            .map_err(
+                                RenderError::<<GlMultiRenderer as RendererSuper>::Error>::Rendering,
+                            )?;
+                        frame
+                            .as_mut()
+                            .render_texture_from_to(
+                                pre_postprocess_data.cursor_texture.as_ref().unwrap(),
+                                Rectangle::new(
+                                    Point::from((0., 0.)),
+                                    cursor_geometry
+                                        .size
+                                        .to_logical(1)
+                                        .to_buffer(1, Transform::Normal)
+                                        .to_f64(),
+                                ),
+                                *cursor_geometry,
+                                &cursor_damage,
+                                &[*cursor_geometry],
+                                Transform::Normal,
+                                1.0,
+                            )
+                            .map_err(GlMultiError::Render)
+                            .map_err(
+                                RenderError::<<GlMultiRenderer as RendererSuper>::Error>::Rendering,
+                            )?;
+                        let sync2 = frame.finish().map_err(
+                            RenderError::<<GlMultiRenderer as RendererSuper>::Error>::Rendering,
+                        )?;
+                        renderer.wait(&sync2).map_err(
+                            RenderError::<<GlMultiRenderer as RendererSuper>::Error>::Rendering,
+                        )?;
+                    }
+                }
+            } else {
             let tex_fb = renderer
                 .bind(tex)
                 .map_err(RenderError::<<GlMultiRenderer as RendererSuper>::Error>::Rendering)?;
@@ -2094,6 +2227,7 @@ fn send_screencopy_result<'a>(
             } else {
                 fb = Some(tex_fb);
             }
+            } // end of `if path_b_tonedown { ... } else { ... }`
         } else {
             sync = frame_result
                 .blit_frame_result(
@@ -2192,6 +2326,28 @@ fn postprocess_elements<'a>(
             .map(|val| val as u8 as f32)
             .unwrap_or(0.)
     };
+    // Path B activation flag for the MAIN offscreen element. When Path B is on
+    // (`hdr_enabled && path_b_enabled()`), the offscreen FB is RGBA16F holding
+    // linear BT.2020 ref_white-scaled values — so this uniform MUST be 1.0 so
+    // the postprocess shader skips the redundant sRGB→linear→matrix→ref_white
+    // pre-stages (already applied per-surface in clipped_surface.frag) and
+    // goes straight to sat/gamma + PQ encode.
+    //
+    // ROOT-CAUSE FIX for the "PrintScreen permanently washes the desktop" bug:
+    // previously the main element omitted the path_b_active uniform entirely.
+    // GL uniforms are program state, not per-draw — they retain whatever was
+    // last set. The cursor element below pushes path_b_active=0.0 when present,
+    // so once the cursor screencopy path triggered (the moment a screen-capture
+    // session arrived with draw_cursor=false, i.e. PrintScreen), the main
+    // element inherited 0.0 and the shader re-decoded the already-linear pixels
+    // as sRGB → washed live output. The 0.0 stuck for every subsequent frame
+    // because nothing reset it, so the desktop stayed washed until reboot.
+    let path_b_main_active: f32 =
+        if hdr_enabled && crate::backend::render::clipped_surface::path_b_enabled() {
+            1.0
+        } else {
+            0.0
+        };
     // Log color_mode transitions only — once per change rather than per frame —
     // so we can confirm in journal whether the PQ shader is actually engaging.
     {
@@ -2292,6 +2448,14 @@ fn postprocess_elements<'a>(
             Uniform::new("hdr_gamut_mix", hdr_gamut_mix),
             Uniform::new("hdr_saturation", hdr_saturation),
             Uniform::new("hdr_midtone_gamma", hdr_midtone_gamma),
+            // Path B: 1.0 → main offscreen is linear RGBA16F, skip the shader's
+            // sRGB-decode + matrix + ref_white pre-stages. 0.0 → offscreen is
+            // sRGB, do the full pipeline (matches old behavior in non-Path-B).
+            // MUST be set explicitly here even when 0.0 — otherwise the program
+            // inherits whatever the cursor element last bound (also 0.0 but
+            // unrelated reason), and worse, in Path B mode it'd inherit 0.0 too
+            // which silently double-decodes the offscreen → washed output.
+            Uniform::new("path_b_active", path_b_main_active),
         ],
     ));
 
