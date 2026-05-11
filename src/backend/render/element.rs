@@ -197,6 +197,19 @@ where
             CosmicElement::Egui(elem) => elem.is_framebuffer_effect(),
         }
     }
+
+    fn allow_direct_scanout(&self) -> bool {
+        match self {
+            CosmicElement::Workspace(elem) => elem.allow_direct_scanout(),
+            CosmicElement::Cursor(elem) => elem.allow_direct_scanout(),
+            CosmicElement::Dnd(elem) => elem.allow_direct_scanout(),
+            CosmicElement::MoveGrab(elem) => elem.allow_direct_scanout(),
+            CosmicElement::Postprocess(elem) => elem.allow_direct_scanout(),
+            CosmicElement::Zoom(elem) => elem.allow_direct_scanout(),
+            #[cfg(feature = "debug")]
+            CosmicElement::Egui(elem) => elem.allow_direct_scanout(),
+        }
+    }
 }
 
 impl<R> RenderElement<R> for CosmicElement<R>

@@ -74,6 +74,7 @@ use smithay::{
     wayland::{
         alpha_modifier::AlphaModifierState,
         color_management::{ColorManagementCapabilities, ColorManagementState},
+        color_representation::{ColorRepresentationCapabilities, ColorRepresentationState},
         compositor::{CompositorClientState, CompositorState, SurfaceData},
         cursor_shape::CursorShapeManagerState,
         dmabuf::{DmabufFeedback, DmabufGlobal, DmabufState},
@@ -250,6 +251,7 @@ pub struct Common {
 
     // wayland state
     pub color_management_state: ColorManagementState,
+    pub color_representation_state: ColorRepresentationState,
     pub compositor_state: CompositorState,
     pub corner_radius_state: CornerRadiusState,
     pub data_device_state: DataDeviceState,
@@ -683,6 +685,10 @@ impl State {
         AlphaModifierState::new::<Self>(dh);
         let color_management_state =
             ColorManagementState::new::<Self>(dh, ColorManagementCapabilities::conservative());
+        let color_representation_state = ColorRepresentationState::new::<Self>(
+            dh,
+            ColorRepresentationCapabilities::conservative(),
+        );
         SinglePixelBufferState::new::<Self>(dh);
         FixesState::new::<Self>(dh);
 
@@ -761,6 +767,7 @@ impl State {
                 theme: cosmic::theme::system_preference(),
 
                 color_management_state,
+                color_representation_state,
                 compositor_state,
                 corner_radius_state,
                 data_device_state,
