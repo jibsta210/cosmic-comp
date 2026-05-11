@@ -767,26 +767,51 @@ impl CosmicSurface {
         alpha: f32,
     ) -> Vec<C>
     where
-        R: Renderer + ImportAll,
+        R: Renderer + ImportAll + smithay::backend::renderer::ImportMem
+            + crate::backend::render::element::AsGlowRenderer,
         R::TextureId: Clone + 'static,
-        C: From<WaylandSurfaceRenderElement<R>>,
+        C: From<WaylandSurfaceRenderElement<R>>
+            + From<crate::backend::render::clipped_surface::ClippedSurfaceRenderElement<R>>,
     {
         match self.0.underlying_surface() {
             WindowSurface::Wayland(toplevel) => {
                 let surface = toplevel.wl_surface();
+                let hdr_path_b =
+                    crate::backend::render::clipped_surface::render_hdr_active();
                 PopupManager::popups_for_surface(surface)
                     .flat_map(move |(popup, popup_offset)| {
                         let offset = (self.0.geometry().loc + popup_offset - popup.geometry().loc)
                             .to_physical_precise_round(scale);
 
-                        render_elements_from_surface_tree(
-                            renderer,
-                            popup.wl_surface(),
-                            location + offset,
-                            scale,
-                            alpha,
-                            FRAME_TIME_FILTER,
-                        )
+                        let wsrs: Vec<WaylandSurfaceRenderElement<R>> =
+                            render_elements_from_surface_tree(
+                                renderer,
+                                popup.wl_surface(),
+                                location + offset,
+                                scale,
+                                alpha,
+                                FRAME_TIME_FILTER,
+                            );
+
+                        // Path B — wrap each popup WSR with the linearize shader
+                        // (no-op clipping radius). Outside Path B, pass through
+                        // as plain WSR.
+                        wsrs.into_iter()
+                            .map(|wsr| {
+                                if hdr_path_b {
+                                    use smithay::backend::renderer::element::Element;
+                                    let elem_geo =
+                                        wsr.geometry(scale).to_f64().to_logical(scale);
+                                    C::from(
+                                        crate::backend::render::clipped_surface::ClippedSurfaceRenderElement::new(
+                                            renderer, wsr, scale, elem_geo, [0u8; 4],
+                                        ),
+                                    )
+                                } else {
+                                    C::from(wsr)
+                                }
+                            })
+                            .collect::<Vec<C>>()
                     })
                     .collect()
             }

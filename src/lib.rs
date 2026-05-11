@@ -373,7 +373,22 @@ fn push_hdr_tuning_to_surfaces(state: &mut state::State) {
                 let ref_white = cfg.hdr_reference_white.map(|n| n as f32).unwrap_or(250.0);
                 let gamut_mix = cfg.hdr_gamut_strength.map(|p| (p as f32) / 100.0).unwrap_or(1.0);
                 let saturation = cfg.hdr_saturation.map(|p| (p as f32) / 100.0).unwrap_or(1.2);
-                let midtone_gamma = cfg.hdr_midtone_gamma.map(|p| (p as f32) / 100.0).unwrap_or(0.7);
+                // Path B's per-surface linearize produces colorimetrically
+                // correct SDR luminance (~ref_white cd/m²) which is dim
+                // relative to the panel's HDR peak. The CRTC path's default
+                // 0.7 midtone exponent makes SDR pop; Path B needs a higher
+                // value (~1.4-1.5) to compensate for the different math
+                // composition order. Default only kicks in if the user hasn't
+                // explicitly set hdr_midtone_gamma in outputs.ron.
+                let default_midtone = if crate::backend::render::clipped_surface::path_b_enabled() {
+                    1.5
+                } else {
+                    0.7
+                };
+                let midtone_gamma = cfg
+                    .hdr_midtone_gamma
+                    .map(|p| (p as f32) / 100.0)
+                    .unwrap_or(default_midtone);
                 let test_pattern = cfg.hdr_test_pattern.unwrap_or(false);
                 warn!(
                     "[HDR] surgical push to {}: cs={:.1} ref_w={:.1} mix={:.2} sat={:.2} gamma={:.2} test={}",

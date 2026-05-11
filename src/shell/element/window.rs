@@ -346,7 +346,8 @@ impl CosmicWindow {
         alpha: f32,
     ) -> Vec<C>
     where
-        R: Renderer + ImportAll + ImportMem,
+        R: Renderer + ImportAll + ImportMem
+            + crate::backend::render::element::AsGlowRenderer,
         R::TextureId: Send + Clone + 'static,
         C: From<CosmicWindowRenderElement<R>>,
     {

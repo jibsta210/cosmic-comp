@@ -2253,16 +2253,12 @@ fn postprocess_elements<'a>(
                 Uniform::new("hdr_gamut_mix", hdr_gamut_mix),
                 Uniform::new("hdr_saturation", hdr_saturation),
                 Uniform::new("hdr_midtone_gamma", hdr_midtone_gamma),
-                Uniform::new(
-                    "path_b_active",
-                    if hdr_enabled
-                        && crate::backend::render::clipped_surface::path_b_enabled()
-                    {
-                        1.0_f32
-                    } else {
-                        0.0_f32
-                    },
-                ),
+                // Cursor texture is rendered as sRGB Argb8888 (it doesn't go
+                // through the per-surface Path B linearize stage). Force
+                // path_b_active=0.0 here so the postprocess shader applies
+                // its full sRGB→linear→matrix→ref_white→PQ pipeline to the
+                // cursor pixels, matching what they were before Path B.
+                Uniform::new("path_b_active", 0.0_f32),
             ],
         ));
     }

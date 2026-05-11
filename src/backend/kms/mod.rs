@@ -1379,9 +1379,19 @@ impl KmsGuard<'_> {
                                         let saturation = hdr_saturation_setting
                                             .map(|p| (p as f32) / 100.0)
                                             .unwrap_or(1.2);
+                                        // Path B linearizes per-surface; the CRTC
+                                        // path's `0.7` default leaves SDR content
+                                        // too dim in Path B's composite. Higher
+                                        // default for that path.
+                                        let default_midtone =
+                                            if crate::backend::render::clipped_surface::path_b_enabled() {
+                                                1.5
+                                            } else {
+                                                0.7
+                                            };
                                         let midtone_gamma = hdr_midtone_gamma_setting
                                             .map(|p| (p as f32) / 100.0)
-                                            .unwrap_or(0.7);
+                                            .unwrap_or(default_midtone);
                                         let test_pattern =
                                             hdr_test_pattern_setting.unwrap_or(false);
                                         warn!(
