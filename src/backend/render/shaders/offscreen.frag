@@ -285,31 +285,36 @@ void main() {
         //    closes the perceived gap. Implemented as luminance-preserving
         //    `mix(vec3(Y), color, saturation)` so chroma scales but
         //    luminance is preserved (BT.2020 luma weights for our target).
-        // 3a. Midtone gamma in LUMINANCE space — lifts dim SDR-derived pixels
-        //     into the HDR luminance range without desaturating. Default 1.0
-        //     = no lift (colorimetric). 0.6-0.8 makes desktop content look
-        //     "punchy HDR-like." The trick: compute Y, gamma-curve it, scale
-        //     RGB by the ratio so chroma is preserved.
+        // 3a. Midtone gamma in LUMINANCE space.
         //
-        //     In Path B, the midtone lift would also distort real HDR content
-        //     (PQ video from Firefox/mpv that's already at correct absolute
-        //     luminance). Fade the gamma effect out smoothly as Y crosses
-        //     ref_white — pixels above ~ref_white are presumed-HDR and
-        //     should not be lifted further. Below ref_white, full gamma
-        //     applies (lifts SDR midtones). The crossover band is
-        //     [ref_white_scale, 2*ref_white_scale] in Path B.
+        //     PATH B: Normalize Y to SDR-relative units (Y_rel = Y / sdr_white)
+        //     BEFORE applying gamma, so the curve behaves like the hardware
+        //     path: sRGB-1.0 (Y_rel=1.0) is a fixed point of pow(., gamma),
+        //     midtones get the curve. Anything above SDR-1.0 (HDR
+        //     highlights from PQ video etc.) passes through unmodified.
+        //
+        //     Without this normalization, Path B's compressed luminance
+        //     range (sRGB-1.0 = 0.025 in the offscreen) made gamma=1.5 hit
+        //     SDR-white at the deep-midtone position of the curve, darkening
+        //     it 6x (~40 nits instead of 250). Now gamma curves operate in
+        //     the same domain as hardware path / user expectation.
+        //
+        //     Phase 2A.2 (no Path B): existing math — gamma on [0,1] linear
+        //     pre-ref_white-scale. Unchanged.
         float gamma = (hdr_midtone_gamma < 0.1) ? 1.0 : hdr_midtone_gamma;
         float Y_orig = dot(lin_target, vec3(0.2627, 0.6780, 0.0593));
-        float gamma_eff = gamma;
+        float Y_new;
         if (path_b_active > 0.5) {
-            // ref_white in linear Path B units. hdr_ref_white is in nits;
-            // /10000 brings to PQ-aligned linear scale (= what the per-surface
-            // linearize stage scaled SDR-1.0 to).
             float sdr_white = max(hdr_ref_white, 1.0) / 10000.0;
-            float fade = clamp((Y_orig - sdr_white) / sdr_white, 0.0, 1.0);
-            gamma_eff = mix(gamma, 1.0, fade);
+            float Y_rel = Y_orig / max(sdr_white, 0.0001);
+            float Y_rel_sdr = min(Y_rel, 1.0);
+            float Y_new_sdr = pow(max(Y_rel_sdr, 0.0), gamma);
+            // SDR portion gets gamma; HDR excess (Y_rel > 1) passes through.
+            float Y_new_rel = Y_new_sdr + max(Y_rel - 1.0, 0.0);
+            Y_new = Y_new_rel * sdr_white;
+        } else {
+            Y_new = pow(max(Y_orig, 0.0), gamma);
         }
-        float Y_new = pow(max(Y_orig, 0.0), gamma_eff);
         float lift_scale = (Y_orig > 0.0001) ? (Y_new / Y_orig) : 1.0;
         vec3 lin_lifted = lin_target * lift_scale;
 
