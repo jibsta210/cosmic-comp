@@ -305,6 +305,11 @@ fn push_hdr_tuning_to_surfaces(state: &mut state::State) {
         v
     };
 
+    // Track which outputs had HDR config changes so we can fire
+    // wp_color_management_v1's image_description_changed events after the
+    // backend borrow drops.
+    let mut changed_outputs: Vec<smithay::output::Output> = Vec::new();
+
     let kms = match &mut state.backend {
         BackendData::Kms(k) => k,
         _ => {
@@ -335,9 +340,15 @@ fn push_hdr_tuning_to_surfaces(state: &mut state::State) {
             };
 
             // Update the per-Output cached config so other code sees the new
-            // HDR fields without going through the full apply path.
-            {
+            // HDR fields without going through the full apply path. Track if
+            // the protocol-relevant fields actually shifted; if so, queue this
+            // Output for a wp_color_management_v1 change broadcast after the
+            // backend borrow ends.
+            let protocol_relevant_changed = {
                 let mut out_cfg = surface.output.config_mut();
+                let changed = out_cfg.hdr_enabled != cfg.hdr_enabled
+                    || out_cfg.hdr_colorspace != cfg.hdr_colorspace
+                    || out_cfg.hdr_reference_white != cfg.hdr_reference_white;
                 out_cfg.hdr_enabled = cfg.hdr_enabled;
                 out_cfg.hdr_colorspace = cfg.hdr_colorspace;
                 out_cfg.hdr_reference_white = cfg.hdr_reference_white;
@@ -345,6 +356,10 @@ fn push_hdr_tuning_to_surfaces(state: &mut state::State) {
                 out_cfg.hdr_saturation = cfg.hdr_saturation;
                 out_cfg.hdr_midtone_gamma = cfg.hdr_midtone_gamma;
                 out_cfg.hdr_test_pattern = cfg.hdr_test_pattern;
+                changed
+            };
+            if protocol_relevant_changed {
+                changed_outputs.push(surface.output.clone());
             }
 
             // Push to surface render thread.
@@ -373,6 +388,16 @@ fn push_hdr_tuning_to_surfaces(state: &mut state::State) {
 
     if pushed == 0 {
         warn!("[HDR] SIGUSR1 surgical reload: no surfaces matched any outputs.ron entry");
+    }
+
+    // Backend borrow has dropped. Broadcast wp_color_management_v1's
+    // image_description_changed for any output whose protocol-relevant fields
+    // shifted. Clients then re-call get_image_description and observe the new
+    // BT.2020/PQ description (or sRGB if HDR was just turned off).
+    for output in changed_outputs {
+        smithay::wayland::color_management::notify_output_image_description_changed(
+            state, &output,
+        );
     }
 }
 
