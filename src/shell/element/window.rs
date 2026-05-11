@@ -547,6 +547,16 @@ impl CosmicWindow {
             return Vec::new();
         }
 
+        // Path B — read the toplevel's wp_color_management description ONCE
+        // here and thread it into every WSR that gets wrapped. Subsurfaces
+        // typically inherit color state from their parent toplevel, so this
+        // matches what real HDR clients (Firefox PQ video, mpv, GStreamer)
+        // expect. None means SDR / no description attached = default sRGB,
+        // or an X11 toplevel which can't speak wp_color_management.
+        let toplevel_surface = self
+            .0
+            .with_program(|p| p.window.wl_surface().map(|cow| cow.into_owned()));
+
         elements.extend(window_elements.into_iter().map(|elem| {
             if has_ssd {
                 radii[1] = 0;
@@ -570,9 +580,18 @@ impl CosmicWindow {
                     // that produce a no-op clip pass.
                     ([0u8; 4], elem.geometry(scale).to_f64().to_logical(scale))
                 };
-                CosmicWindowRenderElement::Clipped(ClippedSurfaceRenderElement::new(
-                    renderer, elem, scale, clip_geo, clip_radii,
-                ))
+                let clipped = if let Some(surface) = toplevel_surface.as_ref() {
+                    ClippedSurfaceRenderElement::new_for_surface(
+                        renderer, elem, scale, clip_geo, clip_radii, surface,
+                    )
+                } else {
+                    // X11 toplevel / no underlying WlSurface — fall back to
+                    // the frame-only color transform.
+                    ClippedSurfaceRenderElement::new(
+                        renderer, elem, scale, clip_geo, clip_radii,
+                    )
+                };
+                CosmicWindowRenderElement::Clipped(clipped)
             } else {
                 CosmicWindowRenderElement::Window(elem)
             }

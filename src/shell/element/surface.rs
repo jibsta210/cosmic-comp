@@ -783,10 +783,11 @@ impl CosmicSurface {
                         let offset = (self.0.geometry().loc + popup_offset - popup.geometry().loc)
                             .to_physical_precise_round(scale);
 
+                        let popup_surface = popup.wl_surface().clone();
                         let wsrs: Vec<WaylandSurfaceRenderElement<R>> =
                             render_elements_from_surface_tree(
                                 renderer,
-                                popup.wl_surface(),
+                                &popup_surface,
                                 location + offset,
                                 scale,
                                 alpha,
@@ -794,8 +795,9 @@ impl CosmicSurface {
                             );
 
                         // Path B — wrap each popup WSR with the linearize shader
-                        // (no-op clipping radius). Outside Path B, pass through
-                        // as plain WSR.
+                        // (no-op clipping radius), reading the popup's own
+                        // wp_color_management_v1 description if it has one.
+                        // Outside Path B, pass through as plain WSR.
                         wsrs.into_iter()
                             .map(|wsr| {
                                 if hdr_path_b {
@@ -803,8 +805,9 @@ impl CosmicSurface {
                                     let elem_geo =
                                         wsr.geometry(scale).to_f64().to_logical(scale);
                                     C::from(
-                                        crate::backend::render::clipped_surface::ClippedSurfaceRenderElement::new(
+                                        crate::backend::render::clipped_surface::ClippedSurfaceRenderElement::new_for_surface(
                                             renderer, wsr, scale, elem_geo, [0u8; 4],
+                                            &popup_surface,
                                         ),
                                     )
                                 } else {

@@ -805,6 +805,11 @@ impl CosmicStack {
                 ))
             });
 
+            // Path B — read the active toplevel's wp_color_management
+            // description once per render call. Same rationale as window.rs.
+            let active_surface = windows[active]
+                .wl_surface()
+                .map(|cow| cow.into_owned());
             border.into_iter().chain(
                 windows[active]
                     .render_elements::<R, WaylandSurfaceRenderElement<R>>(
@@ -832,9 +837,16 @@ impl CosmicStack {
                                     elem.geometry(scale).to_f64().to_logical(scale),
                                 )
                             };
-                            CosmicStackRenderElement::Clipped(ClippedSurfaceRenderElement::new(
-                                renderer, elem, scale, clip_geo, clip_radii,
-                            ))
+                            let clipped = if let Some(surface) = active_surface.as_ref() {
+                                ClippedSurfaceRenderElement::new_for_surface(
+                                    renderer, elem, scale, clip_geo, clip_radii, surface,
+                                )
+                            } else {
+                                ClippedSurfaceRenderElement::new(
+                                    renderer, elem, scale, clip_geo, clip_radii,
+                                )
+                            };
+                            CosmicStackRenderElement::Clipped(clipped)
                         } else {
                             CosmicStackRenderElement::Window(elem)
                         }

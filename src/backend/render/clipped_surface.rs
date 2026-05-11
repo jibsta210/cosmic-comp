@@ -24,7 +24,10 @@ use smithay::{
         Primaries as ProtoPrimaries, TransferFunction as ProtoTransferFunction,
     },
     utils::user_data::UserDataMap,
-    wayland::color_management::{ImageDescription, PrimariesDef, TransferFunctionDef},
+    reexports::wayland_server::protocol::wl_surface::WlSurface,
+    wayland::color_management::{
+        ImageDescription, PrimariesDef, TransferFunctionDef, with_surface_image_description,
+    },
 };
 
 use crate::backend::render::element::AsGlowRenderer;
@@ -197,6 +200,32 @@ impl ColorTransform {
         }
     }
 
+    /// Variant of [`Self::for_current_frame`] that also reads the surface's
+    /// `wp_color_management_v1` image description (via smithay's
+    /// `with_surface_image_description`) and threads it through. This is the
+    /// path that handles real HDR clients — when a Firefox HDR video tags
+    /// its surface as PQ BT.2020, we'll honor the transfer function and
+    /// primaries matrix instead of assuming sRGB BT.709.
+    ///
+    /// Falls back to passthrough outside Path B / HDR, and to sRGB if the
+    /// surface has no description attached (which matches every SDR
+    /// client's content).
+    pub fn for_current_frame_with_surface(surface: &WlSurface) -> Self {
+        if !path_b_enabled() {
+            return Self::passthrough();
+        }
+        match current_hdr_context() {
+            Some((true, ref_white_nits)) => {
+                // Clone out the Arc so we can drop the cached_state borrow
+                // before passing the description into the builder.
+                let desc =
+                    with_surface_image_description(surface, |d, _intent| d.cloned());
+                Self::for_surface(desc.as_ref(), true, ref_white_nits)
+            }
+            _ => Self::passthrough(),
+        }
+    }
+
     /// Identity transform — shader skips the linearize block, behavior matches
     /// niri's original clipping-only path.
     pub fn passthrough() -> Self {
@@ -346,6 +375,32 @@ where
             geometry,
             radius,
             ColorTransform::for_current_frame(),
+        )
+    }
+
+    /// Variant of [`Self::new`] that reads the surface's
+    /// `wp_color_management_v1` description and threads it through. Use this
+    /// when you have the underlying `WlSurface` handy — gives real HDR
+    /// clients (PQ BT.2020 video, HLG, etc.) correct linearization instead
+    /// of the sRGB default.
+    pub fn new_for_surface(
+        renderer: &mut R,
+        elem: WaylandSurfaceRenderElement<R>,
+        scale: Scale<f64>,
+        geometry: Rectangle<f64, Logical>,
+        radius: [u8; 4],
+        surface: &WlSurface,
+    ) -> Self
+    where
+        R: AsGlowRenderer,
+    {
+        Self::new_with_color(
+            renderer,
+            elem,
+            scale,
+            geometry,
+            radius,
+            ColorTransform::for_current_frame_with_surface(surface),
         )
     }
 
