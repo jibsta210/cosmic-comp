@@ -401,7 +401,16 @@ pub fn set_max_bpc(dev: &impl ControlDevice, conn: connector::Handle, bpc: u32) 
 /// this code had separate arrays which produced a garbled layout and caused
 /// atomic commits to fail (panel firmware rejected the bad InfoFrame and
 /// rendering froze).
-#[repr(C, packed)]
+// `#[repr(C)]`, NOT `packed`: the kernel's `struct hdr_output_metadata` uses
+// natural alignment, and its leading `__u32` forces the whole struct to
+// 4-byte alignment — so its 30 bytes of fields round up to a 32-byte struct.
+// The kernel rejects any HDR_OUTPUT_METADATA blob whose length isn't exactly
+// `sizeof(struct hdr_output_metadata)` == 32, so this struct must also be 32
+// bytes. `packed` would collapse it to 30 and the atomic commit would fail
+// with EINVAL. Every field here is already naturally aligned, so `repr(C)`
+// changes no field offset — it only restores the trailing pad (spelled out
+// below as `_padding` so no uninitialized bytes reach the blob).
+#[repr(C)]
 #[derive(Clone, Copy)]
 struct HdrOutputMetadata {
     /// 0 = HDR_OUTPUT_METADATA_TYPE1 (the only kind defined as of 6.x)
@@ -427,6 +436,9 @@ struct HdrOutputMetadata {
     max_cll: u16,
     /// Maximum Frame Average Light Level (frame avg) in cd/m^2.
     max_fall: u16,
+    /// Explicit tail padding to the kernel's 32-byte `struct
+    /// hdr_output_metadata`. Always 0; see the struct-level comment.
+    _padding: u16,
 }
 
 /// EOTF: SMPTE ST 2084 (PQ) — the modern HDR standard used by HDR10 etc.
@@ -539,14 +551,16 @@ impl HdrMasteringLuminance {
     }
 }
 
-/// Build the raw bytes of an HDR_OUTPUT_METADATA blob describing PQ-encoded
-/// HDR content with BT.2020 primaries and D65 white, mastered to the given
-/// luminance bounds. Resulting buffer goes into `Device::create_property_blob`.
-fn build_hdr_metadata_blob(
+/// Build the `HDR_OUTPUT_METADATA` payload describing PQ-encoded HDR content
+/// with the given container's primaries and D65 white, mastered to the given
+/// luminance bounds. The returned POD struct is handed straight to
+/// `Device::create_property_blob` — see `create_hdr_metadata_blob` for why it
+/// must be the struct itself and not a `Vec<u8>`.
+fn build_hdr_metadata(
     lum: HdrMasteringLuminance,
     container: HdrColorContainer,
-) -> Vec<u8> {
-    let m = HdrOutputMetadata {
+) -> HdrOutputMetadata {
+    HdrOutputMetadata {
         metadata_type: 0, // HDR_OUTPUT_METADATA_TYPE1
         eotf: EOTF_PQ,
         static_metadata_type: 0,
@@ -556,14 +570,8 @@ fn build_hdr_metadata_blob(
         min_display_mastering_luminance: lum.min_lum_units,
         max_cll: lum.max_cll_nits,
         max_fall: lum.max_fall_nits,
-    };
-    let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(
-            (&m as *const HdrOutputMetadata) as *const u8,
-            std::mem::size_of::<HdrOutputMetadata>(),
-        )
-    };
-    bytes.to_vec()
+        _padding: 0,
+    }
 }
 
 /// Look up the raw u64 value of a `Colorspace` enum variant by name on the
@@ -613,9 +621,14 @@ pub fn create_hdr_metadata_blob(
     lum: HdrMasteringLuminance,
     container: HdrColorContainer,
 ) -> Result<u64> {
-    let bytes = build_hdr_metadata_blob(lum, container);
+    let metadata = build_hdr_metadata(lum, container);
+    // `create_property_blob::<T>` blobs exactly `size_of::<T>()` bytes read
+    // from the reference. Pass the `#[repr(C, packed)]` POD struct directly:
+    // passing a `&Vec<u8>` (as this used to) blobs the 24-byte Vec header
+    // (heap ptr + len + cap), not the metadata — the kernel then sees a
+    // malformed `struct hdr_output_metadata` and rejects the atomic commit.
     let blob = dev
-        .create_property_blob(&bytes)
+        .create_property_blob(&metadata)
         .context("create HDR_OUTPUT_METADATA blob")?;
     Ok(blob.into())
 }
@@ -698,41 +711,40 @@ pub fn crtc_has_color_pipeline(
         }
 }
 
-/// Create a kernel property blob from a `Vec<DrmColorLutEntry>`. The kernel
+/// Create a kernel property blob from a `&[DrmColorLutEntry]`. The kernel
 /// expects the bytes laid out as `struct drm_color_lut[]` — RGB+reserved
 /// u16 quads, exactly what `DrmColorLutEntry` already is via `#[repr(C, packed)]`.
 ///
-/// `create_property_blob` requires `T: Sized` so we copy into a heap-owned
-/// `Vec<u8>` first (already-Sized via the Vec's pointer/length/capacity).
+/// The safe `Device::create_property_blob::<T>` is generic over `Sized` `T`
+/// and blobs exactly `size_of::<T>()` bytes — it cannot express a
+/// runtime-sized LUT (and passing `&Vec<u8>` blobs the 24-byte Vec header,
+/// not the data). So go through the raw `drm_ffi` ioctl wrapper, which takes
+/// a `&mut [u8]` and uses its real length.
 pub fn create_color_lut_blob(
     dev: &impl ControlDevice,
     entries: &[crate::backend::render::hw_color_pipeline::DrmColorLutEntry],
 ) -> Result<u64> {
-    let bytes: Vec<u8> = unsafe {
+    let mut bytes: Vec<u8> = unsafe {
         std::slice::from_raw_parts(
             entries.as_ptr() as *const u8,
             std::mem::size_of_val(entries),
         )
     }
     .to_vec();
-    let blob = dev
-        .create_property_blob(&bytes)
+    let blob = smithay::reexports::drm_ffi::mode::create_property_blob(dev.as_fd(), &mut bytes)
         .context("create color LUT blob")?;
-    Ok(blob.into())
+    Ok(blob.blob_id as u64)
 }
 
 /// Create a kernel property blob from a CTM matrix encoded as 9 u64
 /// sign-magnitude S31.32 values (kernel `struct drm_color_ctm`).
 pub fn create_ctm_blob(dev: &impl ControlDevice, matrix: &[u64; 9]) -> Result<u64> {
-    let bytes: Vec<u8> = unsafe {
-        std::slice::from_raw_parts(
-            matrix.as_ptr() as *const u8,
-            std::mem::size_of::<[u64; 9]>(),
-        )
-    }
-    .to_vec();
+    // `[u64; 9]` is `Sized` (72 bytes), so hand it straight to
+    // `create_property_blob` — it blobs `size_of::<[u64; 9]>()` bytes from the
+    // reference, which is exactly the matrix. (Passing a `&Vec<u8>` would blob
+    // the Vec's 24-byte header instead and the kernel would reject the CTM.)
     let blob = dev
-        .create_property_blob(&bytes)
+        .create_property_blob(matrix)
         .context("create CTM blob")?;
     Ok(blob.into())
 }
