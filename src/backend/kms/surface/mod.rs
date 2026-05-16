@@ -167,6 +167,13 @@ pub struct SurfaceThreadState {
     /// hardware does the encode). When false, shader runs the full
     /// software encoding path (color_mode=5.0).
     hdr_hardware_path_active: bool,
+    /// Packed snapshot of the HDR render-loop state (hdr_enabled,
+    /// needs_offscreen, screen_filter active, hw_path, test_pattern) as of
+    /// the last `redraw`, used to log "render-loop state transition" only
+    /// on a real change. Per-surface — a process-wide `static` here would
+    /// be clobbered by every other output's render thread and fire the log
+    /// every frame. `0xFF` means "nothing logged yet".
+    hdr_log_last_state: u8,
     postprocess_textures: HashMap<DrmNode, PostprocessState>,
 
     shell: Arc<parking_lot::RwLock<Shell>>,
@@ -634,6 +641,7 @@ fn surface_thread(
         hdr_midtone_gamma: 0.7,         // lift SDR midtones into HDR luminance range (Windows AutoHDR-like)
         hdr_test_pattern: false,
         hdr_hardware_path_active: false,
+        hdr_log_last_state: 0xFF,
         postprocess_textures: HashMap::new(),
 
         shell,
@@ -1276,14 +1284,13 @@ impl SurfaceThreadState {
         // says so AND whether we're scanning out directly vs going through
         // the postprocess offscreen pass.
         {
-            use std::sync::atomic::{AtomicU8, Ordering};
-            static LAST_STATE: AtomicU8 = AtomicU8::new(0xFF);
             let bits = (self.hdr_enabled as u8)
                 | ((needs_offscreen as u8) << 1)
                 | ((!self.screen_filter.is_noop() as u8) << 2)
                 | ((self.hdr_hardware_path_active as u8) << 3)
                 | ((self.hdr_test_pattern as u8) << 4);
-            if LAST_STATE.swap(bits, Ordering::Relaxed) != bits {
+            if self.hdr_log_last_state != bits {
+                self.hdr_log_last_state = bits;
                 trace!(
                     hdr_enabled = self.hdr_enabled,
                     hw_path = self.hdr_hardware_path_active,
