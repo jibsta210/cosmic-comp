@@ -916,17 +916,23 @@ impl KmsGuard<'_> {
                 let max_bpc_setting = output_config.0.max_bpc;
                 std::mem::drop(output_config);
 
+                // Identify the kernel driver once — several HDR quirks below
+                // are driver-specific.
+                let driver_name = drm
+                    .device()
+                    .get_driver()
+                    .map(|d| d.name().to_string_lossy().to_lowercase())
+                    .unwrap_or_default();
+                let is_xe = driver_name == "xe";
+                // The NVIDIA proprietary stack ("nvidia"/"nvidia-drm").
+                let is_nvidia = driver_name.contains("nvidia");
+
                 // VRR + HDR atomic commits are only known-broken on the Intel
                 // `xe` driver (it rejects the full `commit()` path when
                 // HDR_OUTPUT_METADATA rides along with other connector state).
                 // amdgpu and nvidia-drm drive VRR fine in HDR modes, so only
                 // suppress VRR setup for `xe`.
-                let hdr_vrr_unsafe = hdr_enabled_setting == Some(true)
-                    && drm
-                        .device()
-                        .get_driver()
-                        .map(|d| d.name().to_string_lossy().eq_ignore_ascii_case("xe"))
-                        .unwrap_or(false);
+                let hdr_vrr_unsafe = hdr_enabled_setting == Some(true) && is_xe;
 
                 if !test_only {
                     if !surface.is_active() {
@@ -1009,7 +1015,17 @@ impl KmsGuard<'_> {
                             );
                         }
 
-                        let vrr = vrr_setting;
+                        // VRR "automatic" mode toggles adaptive-sync on/off as
+                        // windows enter and leave fullscreen, and on the NVIDIA
+                        // proprietary driver each toggle is a full nvidia-drm
+                        // modeset — flaky enough to wedge the GSP. Demote
+                        // automatic to off on nvidia; an explicit `Force` is
+                        // left alone as a deliberate user choice.
+                        let vrr = if is_nvidia && vrr_setting == AdaptiveSync::Enabled {
+                            AdaptiveSync::Disabled
+                        } else {
+                            vrr_setting
+                        };
 
                         let compositor_ref = drm.compositors().get(crtc).unwrap().lock().unwrap();
                         let vrr_support = compositor_ref
@@ -1067,7 +1083,13 @@ impl KmsGuard<'_> {
                             surface.output.set_adaptive_sync(AdaptiveSync::Disabled);
                         }
                     } else {
-                        let vrr = vrr_setting;
+                        // Demote VRR "automatic" to off on nvidia — see the
+                        // comment in the !surface.is_active() branch above.
+                        let vrr = if is_nvidia && vrr_setting == AdaptiveSync::Enabled {
+                            AdaptiveSync::Disabled
+                        } else {
+                            vrr_setting
+                        };
                         // Same `xe`-only skip rule as above; see the comment in
                         // the !surface.is_active() branch.
                         if !hdr_vrr_unsafe && vrr != surface.output.adaptive_sync() {
@@ -1173,31 +1195,20 @@ impl KmsGuard<'_> {
                                         surface.output.name()
                                     ),
                                 }
-                                // Diagnostic / belt-and-braces: also write
-                                // Colorspace via legacy set_property. Atomic
-                                // path SHOULD carry this via smithay's
-                                // set_hdr_state, but modetest shows
-                                // Colorspace=Default(0) post-setup which would
-                                // silently leave panel in SDR mode and explain
-                                // the persistent washed-out symptom. Writing
-                                // here puts the panel into HDR signaling
-                                // independent of the atomic-commit code path.
-                                let cs_variant = container.colorspace_variant();
-                                match drm_helpers::set_colorspace_legacy(
-                                    drm.device(),
-                                    conn,
-                                    cs_variant,
-                                ) {
-                                    Ok(()) => warn!(
-                                        "[HDR] forced Colorspace={} via legacy set_property on {}",
-                                        cs_variant, surface.output.name()
-                                    ),
-                                    Err(err) => warn!(
-                                        ?err,
-                                        "[HDR] Failed to force Colorspace={} via legacy on {}",
-                                        cs_variant, surface.output.name()
-                                    ),
-                                }
+                                // NOTE: Colorspace is intentionally NOT written
+                                // here via legacy set_property. It's carried by
+                                // the atomic path (smithay's set_hdr_state ->
+                                // Colorspace + HDR_OUTPUT_METADATA in one
+                                // commit). The old "modetest shows
+                                // Colorspace=Default(0)" symptom that motivated a
+                                // belt-and-braces legacy write was a side effect
+                                // of the malformed property blobs: the whole
+                                // atomic HDR commit was rejected, so Colorspace
+                                // never applied either. With correctly-sized
+                                // blobs the atomic commit lands. Dropping the
+                                // legacy write also removes one extra full
+                                // modeset (a link retrain on nvidia) from the
+                                // HDR-enable path.
                                 let abgr2101010_modifier_count = device
                                     .inner
                                     .texture_formats
@@ -1278,6 +1289,19 @@ impl KmsGuard<'_> {
                                         if crate::backend::render::clipped_surface::path_b_enabled() {
                                             warn!(
                                                 "[HDR-HW] COSMIC_HDR_PATH_B=1: skipping CRTC color pipeline blobs (Path B shader-only path)"
+                                            );
+                                            (None, None, None)
+                                        } else if is_nvidia {
+                                            // NVIDIA's GSP firmware watchdog-times-out
+                                            // and the whole GPU wedges when a CRTC
+                                            // DEGAMMA_LUT/CTM/GAMMA_LUT atomic commit
+                                            // reaches it (GSP-CrashCat: "GSP task
+                                            // watchdog timeout", confirmed on 595.44.08
+                                            // / RTX 50-series). The properties are
+                                            // advertised but committing them is fatal.
+                                            // Force the shader encode path on nvidia.
+                                            warn!(
+                                                "[HDR-HW] nvidia driver: skipping CRTC color pipeline blobs (commits crash the GSP firmware); using shader path"
                                             );
                                             (None, None, None)
                                         } else if drm_helpers::crtc_has_color_pipeline(drm.device(), *crtc) {
