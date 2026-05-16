@@ -916,6 +916,18 @@ impl KmsGuard<'_> {
                 let max_bpc_setting = output_config.0.max_bpc;
                 std::mem::drop(output_config);
 
+                // VRR + HDR atomic commits are only known-broken on the Intel
+                // `xe` driver (it rejects the full `commit()` path when
+                // HDR_OUTPUT_METADATA rides along with other connector state).
+                // amdgpu and nvidia-drm drive VRR fine in HDR modes, so only
+                // suppress VRR setup for `xe`.
+                let hdr_vrr_unsafe = hdr_enabled_setting == Some(true)
+                    && drm
+                        .device()
+                        .get_driver()
+                        .map(|d| d.name().to_string_lossy().eq_ignore_ascii_case("xe"))
+                        .unwrap_or(false);
+
                 if !test_only {
                     if !surface.is_active() {
                         let mut planes = drm
@@ -1023,20 +1035,21 @@ impl KmsGuard<'_> {
                         );
 
                         surface.output.set_adaptive_sync_support(vrr_support);
-                        // Skip VRR setup when HDR is enabled. `use_adaptive_sync`
-                        // bumps `pending.vrr`, which makes smithay's
-                        // `commit_pending()` return true, which routes the next
-                        // frame submit through the full `commit()` path (atomic
-                        // commit with all connector props including HDR) instead
-                        // of `page_flip()` (buffer-only). The Intel `xe` driver
-                        // rejects the full commit when HDR_OUTPUT_METADATA is in
-                        // the request alongside other state, cascading into
+                        // Skip VRR setup only on `xe` with HDR enabled.
+                        // `use_adaptive_sync` bumps `pending.vrr`, which makes
+                        // smithay's `commit_pending()` return true, which routes
+                        // the next frame submit through the full `commit()` path
+                        // (atomic commit with all connector props including HDR)
+                        // instead of `page_flip()` (buffer-only). The Intel `xe`
+                        // driver rejects the full commit when HDR_OUTPUT_METADATA
+                        // is in the request alongside other state, cascading into
                         // "Failed to submit rendering" every frame. Forcing the
                         // page-flip path keeps frames flowing; HDR connector
-                        // state still applies via initial mode-set.
-                        if hdr_enabled_setting == Some(true) {
+                        // state still applies via initial mode-set. amdgpu and
+                        // nvidia-drm accept the full commit, so they keep VRR.
+                        if hdr_vrr_unsafe {
                             warn!(
-                                "[HDR] skipping VRR setup on {} (HDR + VRR atomic commits are rejected by xe driver)",
+                                "[HDR] skipping VRR setup on {} (HDR + VRR atomic commits are rejected by the xe driver)",
                                 surface.output.name()
                             );
                         } else if match vrr_support {
@@ -1055,11 +1068,9 @@ impl KmsGuard<'_> {
                         }
                     } else {
                         let vrr = vrr_setting;
-                        // Same skip-when-HDR rule as above; see the comment in
+                        // Same `xe`-only skip rule as above; see the comment in
                         // the !surface.is_active() branch.
-                        if hdr_enabled_setting != Some(true)
-                            && vrr != surface.output.adaptive_sync()
-                        {
+                        if !hdr_vrr_unsafe && vrr != surface.output.adaptive_sync() {
                             if match surface.output.adaptive_sync_support() {
                                 Some(VrrSupport::RequiresModeset)
                                     if vrr == AdaptiveSync::Enabled =>
