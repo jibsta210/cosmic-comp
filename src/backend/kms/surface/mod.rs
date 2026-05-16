@@ -1284,7 +1284,7 @@ impl SurfaceThreadState {
                 | ((self.hdr_hardware_path_active as u8) << 3)
                 | ((self.hdr_test_pattern as u8) << 4);
             if LAST_STATE.swap(bits, Ordering::Relaxed) != bits {
-                warn!(
+                trace!(
                     hdr_enabled = self.hdr_enabled,
                     hw_path = self.hdr_hardware_path_active,
                     test_pattern = self.hdr_test_pattern,
@@ -1523,7 +1523,7 @@ impl SurfaceThreadState {
                     let final_flags = self.frame_flags
                         .union(additional_frame_flags)
                         .difference(remove_frame_flags);
-                    warn!(
+                    trace!(
                         "[HDR-FRAME-CALL] render_frame: hdr_enabled={} elements.len()={} flags={:?} (1/sec)",
                         self.hdr_enabled, elements.len(), final_flags
                     );
@@ -2372,7 +2372,7 @@ fn postprocess_elements<'a>(
             ^ ((hdr_colorspace_for_shader * 10.0) as u32).wrapping_mul(127)
             ^ ((hdr_test_pattern as u32).wrapping_mul(2003));
         if LAST_LOGGED.swap(key, Ordering::Relaxed) != key {
-            warn!(
+            trace!(
                 "[HDR] postprocess_elements building element list: color_mode={:.1} hdr_enabled={} cs={:.1} ref_w={:.1} mix={:.2} test={}",
                 color_mode_value,
                 hdr_enabled,
