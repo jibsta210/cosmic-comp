@@ -504,7 +504,10 @@ pub fn render_workspace_to_buffer(
 }
 
 smithay::render_elements! {
-    pub WindowCaptureElement<R> where R: ImportAll + ImportMem;
+    // `AsGlowRenderer` is required because `CursorRenderElement` now linearizes
+    // via the GLES clipping shader (HDR Path B) and so only implements
+    // `RenderElement` for glow-capable renderers.
+    pub WindowCaptureElement<R> where R: ImportAll + ImportMem + AsGlowRenderer;
     WaylandElement=WaylandSurfaceRenderElement<R>,
     CursorElement=RelocateRenderElement<cursor::CursorRenderElement<R>>,
 }

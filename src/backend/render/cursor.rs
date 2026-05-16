@@ -1,16 +1,24 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-use crate::{utils::prelude::*, wayland::handlers::compositor::FRAME_TIME_FILTER};
+use crate::{
+    backend::render::{
+        clipped_surface::{ClippedSurfaceRenderElement, LinearizedElement},
+        element::AsGlowRenderer,
+    },
+    utils::prelude::*,
+    wayland::handlers::compositor::FRAME_TIME_FILTER,
+};
 use smithay::{
     backend::{
         allocator::Fourcc,
         renderer::{
             ImportAll, ImportMem, Renderer,
             element::{
-                Kind,
+                Element, Id, Kind, RenderElement, UnderlyingStorage,
                 memory::{MemoryRenderBuffer, MemoryRenderBufferRenderElement},
                 surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
             },
+            utils::{CommitCounter, DamageSet, OpaqueRegions},
         },
     },
     input::{
@@ -18,9 +26,9 @@ use smithay::{
         pointer::{CursorIcon, CursorImageAttributes, CursorImageStatus},
     },
     reexports::wayland_server::protocol::wl_surface,
-    render_elements,
     utils::{
-        Buffer as BufferCoords, Logical, Monotonic, Physical, Point, Scale, Size, Time, Transform,
+        Buffer as BufferCoords, Logical, Monotonic, Physical, Point, Rectangle, Scale, Size, Time,
+        Transform, user_data::UserDataMap,
     },
     wayland::compositor::{get_role, with_states},
 };
@@ -117,10 +125,166 @@ fn load_icon(theme: &CursorTheme, shape: CursorIcon) -> Result<Vec<Image>, Error
     parse_xcursor(&cursor_data).ok_or(Error::Parse)
 }
 
-render_elements! {
-    pub CursorRenderElement<R> where R: ImportAll + ImportMem;
-    Static=MemoryRenderBufferRenderElement<R>,
-    Surface=WaylandSurfaceRenderElement<R>,
+/// The cursor is composited into the same offscreen as everything else, so on
+/// an HDR output (Path B) it must be linearized too — otherwise its sRGB
+/// pixels are written verbatim into the linear RGBA16F buffer and the
+/// postprocess PQ-encode blows them up to peak luminance.
+///
+/// The named/themed cursor is a CPU memory buffer, wrapped in
+/// [`LinearizedElement`]; a client-provided cursor surface is a
+/// `WaylandSurfaceRenderElement`, wrapped in [`ClippedSurfaceRenderElement`]
+/// with no corner radius (linearize-only). Both wrappers are transparent
+/// passthroughs outside a Path B HDR frame.
+///
+/// Hand-written rather than via `render_elements!` because that macro emits
+/// the enum with only a `R: Renderer` bound, which can't hold the wrapper
+/// types (they require `R: ImportAll + ImportMem`).
+pub enum CursorRenderElement<R>
+where
+    R: Renderer,
+{
+    Static(LinearizedElement<R>),
+    Surface(ClippedSurfaceRenderElement<R>),
+}
+
+impl<R> Element for CursorRenderElement<R>
+where
+    R: Renderer + ImportAll + ImportMem,
+{
+    fn id(&self) -> &Id {
+        match self {
+            CursorRenderElement::Static(elem) => elem.id(),
+            CursorRenderElement::Surface(elem) => elem.id(),
+        }
+    }
+
+    fn current_commit(&self) -> CommitCounter {
+        match self {
+            CursorRenderElement::Static(elem) => elem.current_commit(),
+            CursorRenderElement::Surface(elem) => elem.current_commit(),
+        }
+    }
+
+    fn src(&self) -> Rectangle<f64, BufferCoords> {
+        match self {
+            CursorRenderElement::Static(elem) => elem.src(),
+            CursorRenderElement::Surface(elem) => elem.src(),
+        }
+    }
+
+    fn geometry(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
+        match self {
+            CursorRenderElement::Static(elem) => elem.geometry(scale),
+            CursorRenderElement::Surface(elem) => elem.geometry(scale),
+        }
+    }
+
+    fn location(&self, scale: Scale<f64>) -> Point<i32, Physical> {
+        match self {
+            CursorRenderElement::Static(elem) => elem.location(scale),
+            CursorRenderElement::Surface(elem) => elem.location(scale),
+        }
+    }
+
+    fn transform(&self) -> Transform {
+        match self {
+            CursorRenderElement::Static(elem) => elem.transform(),
+            CursorRenderElement::Surface(elem) => elem.transform(),
+        }
+    }
+
+    fn damage_since(
+        &self,
+        scale: Scale<f64>,
+        commit: Option<CommitCounter>,
+    ) -> DamageSet<i32, Physical> {
+        match self {
+            CursorRenderElement::Static(elem) => elem.damage_since(scale, commit),
+            CursorRenderElement::Surface(elem) => elem.damage_since(scale, commit),
+        }
+    }
+
+    fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
+        match self {
+            CursorRenderElement::Static(elem) => elem.opaque_regions(scale),
+            CursorRenderElement::Surface(elem) => elem.opaque_regions(scale),
+        }
+    }
+
+    fn alpha(&self) -> f32 {
+        match self {
+            CursorRenderElement::Static(elem) => elem.alpha(),
+            CursorRenderElement::Surface(elem) => elem.alpha(),
+        }
+    }
+
+    fn kind(&self) -> Kind {
+        match self {
+            CursorRenderElement::Static(elem) => elem.kind(),
+            CursorRenderElement::Surface(elem) => elem.kind(),
+        }
+    }
+
+    fn is_framebuffer_effect(&self) -> bool {
+        match self {
+            CursorRenderElement::Static(elem) => elem.is_framebuffer_effect(),
+            CursorRenderElement::Surface(elem) => elem.is_framebuffer_effect(),
+        }
+    }
+
+    fn allow_direct_scanout(&self) -> bool {
+        match self {
+            CursorRenderElement::Static(elem) => elem.allow_direct_scanout(),
+            CursorRenderElement::Surface(elem) => elem.allow_direct_scanout(),
+        }
+    }
+}
+
+impl<R> RenderElement<R> for CursorRenderElement<R>
+where
+    R: AsGlowRenderer + Renderer + ImportAll + ImportMem,
+    R::TextureId: 'static,
+{
+    fn draw(
+        &self,
+        frame: &mut R::Frame<'_, '_>,
+        src: Rectangle<f64, BufferCoords>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+        cache: Option<&UserDataMap>,
+    ) -> Result<(), R::Error> {
+        match self {
+            CursorRenderElement::Static(elem) => {
+                elem.draw(frame, src, dst, damage, opaque_regions, cache)
+            }
+            CursorRenderElement::Surface(elem) => {
+                elem.draw(frame, src, dst, damage, opaque_regions, cache)
+            }
+        }
+    }
+
+    fn underlying_storage(&self, renderer: &mut R) -> Option<UnderlyingStorage<'_>> {
+        match self {
+            CursorRenderElement::Static(elem) => elem.underlying_storage(renderer),
+            CursorRenderElement::Surface(elem) => elem.underlying_storage(renderer),
+        }
+    }
+
+    fn capture_framebuffer(
+        &self,
+        frame: &mut R::Frame<'_, '_>,
+        src: Rectangle<f64, BufferCoords>,
+        dst: Rectangle<i32, Physical>,
+        cache: &UserDataMap,
+    ) -> Result<(), R::Error> {
+        match self {
+            CursorRenderElement::Static(elem) => elem.capture_framebuffer(frame, src, dst, cache),
+            CursorRenderElement::Surface(elem) => {
+                elem.capture_framebuffer(frame, src, dst, cache)
+            }
+        }
+    }
 }
 
 pub fn draw_surface_cursor<R>(
@@ -130,7 +294,7 @@ pub fn draw_surface_cursor<R>(
     scale: impl Into<Scale<f64>>,
 ) -> Vec<(CursorRenderElement<R>, Point<i32, Physical>)>
 where
-    R: Renderer + ImportAll,
+    R: Renderer + ImportAll + ImportMem + AsGlowRenderer,
     R::TextureId: Clone + 'static,
 {
     let scale = scale.into();
@@ -145,17 +309,26 @@ where
             .to_physical_precise_round(scale)
     });
 
-    render_elements_from_surface_tree(
+    let surface_elements: Vec<WaylandSurfaceRenderElement<R>> = render_elements_from_surface_tree(
         renderer,
         surface,
         location.to_physical(scale).to_i32_round(),
         scale,
         1.0,
         Kind::Cursor,
-    )
-    .into_iter()
-    .map(|elem| (elem, h))
-    .collect()
+    );
+    surface_elements
+        .into_iter()
+        .map(|elem| {
+            // Linearize-only wrap (corner_radius = [0; 4] makes the clip/round
+            // stage inert). `new` resolves the current frame's color
+            // transform — passthrough on SDR outputs, sRGB→linear on HDR.
+            let geo = elem.geometry(scale).to_f64().to_logical(scale);
+            let clipped =
+                ClippedSurfaceRenderElement::new(renderer, elem, scale, geo, [0; 4]);
+            (CursorRenderElement::Surface(clipped), h)
+        })
+        .collect()
 }
 
 #[profiling::function]
@@ -261,7 +434,7 @@ pub fn draw_cursor<R>(
     draw_default: bool,
 ) -> Vec<(CursorRenderElement<R>, Point<i32, Physical>)>
 where
-    R: Renderer + ImportMem + ImportAll,
+    R: Renderer + ImportMem + ImportAll + AsGlowRenderer,
     R::TextureId: Send + Clone + 'static,
 {
     // draw the cursor as relevant
@@ -314,18 +487,21 @@ where
             );
         state.current_image = Some(frame);
 
+        let memory_element = MemoryRenderBufferRenderElement::from_buffer(
+            renderer,
+            location.to_physical(scale),
+            pointer_image,
+            None,
+            None,
+            None,
+            Kind::Cursor,
+        )
+        .expect("Failed to import cursor bitmap");
         return vec![(
+            // Passthrough on SDR; `into_path_b_linearized` attaches the
+            // linearize shader when an HDR render frame is active.
             CursorRenderElement::Static(
-                MemoryRenderBufferRenderElement::from_buffer(
-                    renderer,
-                    location.to_physical(scale),
-                    pointer_image,
-                    None,
-                    None,
-                    None,
-                    Kind::Cursor,
-                )
-                .expect("Failed to import cursor bitmap"),
+                LinearizedElement::passthrough(memory_element).into_path_b_linearized(renderer),
             ),
             hotspot.to_physical_precise_round(scale),
         )];

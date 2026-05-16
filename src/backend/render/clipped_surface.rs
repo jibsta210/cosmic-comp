@@ -339,10 +339,14 @@ impl ClippingShader {
     }
 }
 
+// Struct bound is just `R: Renderer` (the fields need no more) so the type
+// stays nameable inside `render_elements!`-generated enums, whose enum
+// definitions carry only a `R: Renderer` bound. `ImportAll + ImportMem` /
+// `AsGlowRenderer` are required on the impls below, not the struct.
 #[derive(Debug)]
 pub struct ClippedSurfaceRenderElement<R>
 where
-    R: Renderer + ImportAll + ImportMem,
+    R: Renderer,
 {
     inner: WaylandSurfaceRenderElement<R>,
     program: GlesTexProgram,
@@ -734,9 +738,13 @@ pub fn path_b_linearize_override<R: AsGlowRenderer>(
 /// Used for the server-side-decoration header, which is a CPU-rendered
 /// memory buffer rather than a `WlSurface` and so does not go through
 /// [`ClippedSurfaceRenderElement`].
+// Struct bound is just `R: Renderer` (the field types only need that much) so
+// the type stays nameable in `render_elements!`-generated enums, whose enum
+// definition is emitted with only a `R: Renderer` bound. The `ImportAll +
+// ImportMem` / `AsGlowRenderer` requirements live on the impls below.
 pub struct LinearizedElement<R>
 where
-    R: Renderer + ImportAll + ImportMem,
+    R: Renderer,
 {
     inner: MemoryRenderBufferRenderElement<R>,
     /// `Some` only inside a Path B HDR frame — the linearize shader program
