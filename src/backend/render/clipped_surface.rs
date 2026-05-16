@@ -15,7 +15,7 @@ use smithay::{
         ImportAll, ImportMem, Renderer,
         element::{
             Element, Id, Kind, RenderElement, UnderlyingStorage,
-            surface::WaylandSurfaceRenderElement,
+            memory::MemoryRenderBufferRenderElement, surface::WaylandSurfaceRenderElement,
         },
         gles::{GlesFrame, GlesRenderer, GlesTexProgram, Uniform, UniformValue},
         utils::{CommitCounter, DamageSet, OpaqueRegions},
@@ -672,5 +672,191 @@ where
 
     fn underlying_storage(&self, _renderer: &mut R) -> Option<UnderlyingStorage<'_>> {
         None
+    }
+}
+
+/// Build the linearize-only tex-program override for a non-`WlSurface`
+/// texture element (e.g. the server-side-decoration header) that is
+/// composited into a Path B HDR offscreen.
+///
+/// Returns `None` outside a Path B HDR frame (or when the resolved color
+/// transform is passthrough) — the caller should then draw the element
+/// normally.
+///
+/// Unlike [`ClippedSurfaceRenderElement`] this does no corner clipping:
+/// `corner_radius` is `0` and `input_to_geo` is identity, which makes the
+/// shader's clip/round stage inert (see `rounding_alpha` in
+/// `clipped_surface.frag` — a zero radius returns alpha `1.0`), so only the
+/// linearize stage runs. The element's sRGB pixels are decoded into the
+/// linear composite space, matching what surfaces get via
+/// `ClippedSurfaceRenderElement`; without it the postprocess PQ-encode
+/// treats the raw sRGB values as linear and blows them up to peak luminance
+/// (the SSD titlebar renders as a solid white bar on HDR outputs).
+pub fn path_b_linearize_override<R: AsGlowRenderer>(
+    renderer: &R,
+) -> Option<(GlesTexProgram, Vec<Uniform<'static>>)> {
+    let color = ColorTransform::for_current_frame();
+    if color.tf_id == tf::PASSTHROUGH {
+        return None;
+    }
+    // Column-major identity 3×3 — with `corner_radius == 0` the clip stage
+    // never reads it meaningfully, but the shader still requires the uniform.
+    const IDENTITY3: [f32; 9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+    let uniforms = vec![
+        Uniform::new("geo_size", (0.0f32, 0.0f32)),
+        Uniform::new("corner_radius", [0.0f32, 0.0, 0.0, 0.0]),
+        Uniform::new(
+            "input_to_geo",
+            UniformValue::Matrix3x3 {
+                matrices: vec![IDENTITY3],
+                transpose: false,
+            },
+        ),
+        Uniform::new("tf_id", color.tf_id),
+        Uniform::new("ref_white_scale", color.ref_white_scale),
+        Uniform::new(
+            "primaries_matrix",
+            UniformValue::Matrix3x3 {
+                matrices: vec![color.primaries_matrix],
+                transpose: false,
+            },
+        ),
+    ];
+    Some((ClippingShader::get(renderer), uniforms))
+}
+
+/// A thin wrapper around a [`MemoryRenderBufferRenderElement`] that, when a
+/// Path B HDR frame is active, runs the linearize shader over it as it is
+/// drawn (see [`path_b_linearize_override`]). Outside Path B / HDR it is a
+/// transparent passthrough — every `Element`/`RenderElement` method delegates
+/// to the inner element and `draw` takes the bare path.
+///
+/// Used for the server-side-decoration header, which is a CPU-rendered
+/// memory buffer rather than a `WlSurface` and so does not go through
+/// [`ClippedSurfaceRenderElement`].
+pub struct LinearizedElement<R>
+where
+    R: Renderer + ImportAll + ImportMem,
+{
+    inner: MemoryRenderBufferRenderElement<R>,
+    /// `Some` only inside a Path B HDR frame — the linearize shader program
+    /// and its uniforms, installed as the default tex program for `draw`.
+    linearize: Option<(GlesTexProgram, Vec<Uniform<'static>>)>,
+}
+
+impl<R> LinearizedElement<R>
+where
+    R: Renderer + ImportAll + ImportMem,
+{
+    /// Wrap a memory element with no transform — behaves byte-for-byte like
+    /// the bare [`MemoryRenderBufferRenderElement`].
+    pub fn passthrough(inner: MemoryRenderBufferRenderElement<R>) -> Self {
+        Self {
+            inner,
+            linearize: None,
+        }
+    }
+
+    /// Attach the Path B linearize shader override. A no-op (stays
+    /// passthrough) outside a Path B HDR frame.
+    pub fn into_path_b_linearized(mut self, renderer: &R) -> Self
+    where
+        R: AsGlowRenderer,
+    {
+        self.linearize = path_b_linearize_override(renderer);
+        self
+    }
+}
+
+impl<R> Element for LinearizedElement<R>
+where
+    R: Renderer + ImportAll + ImportMem,
+{
+    fn id(&self) -> &Id {
+        self.inner.id()
+    }
+
+    fn current_commit(&self) -> CommitCounter {
+        self.inner.current_commit()
+    }
+
+    fn geometry(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
+        self.inner.geometry(scale)
+    }
+
+    fn src(&self) -> Rectangle<f64, Buffer> {
+        self.inner.src()
+    }
+
+    fn transform(&self) -> Transform {
+        self.inner.transform()
+    }
+
+    fn damage_since(
+        &self,
+        scale: Scale<f64>,
+        commit: Option<CommitCounter>,
+    ) -> DamageSet<i32, Physical> {
+        self.inner.damage_since(scale, commit)
+    }
+
+    fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
+        self.inner.opaque_regions(scale)
+    }
+
+    fn alpha(&self) -> f32 {
+        self.inner.alpha()
+    }
+
+    fn kind(&self) -> Kind {
+        self.inner.kind()
+    }
+
+    /// When the linearize shader is active it produces pixels a hardware
+    /// plane can't reproduce, so direct scanout would skip the work and show
+    /// raw (over-bright) sRGB. Reject DS in that case; passthrough delegates.
+    fn allow_direct_scanout(&self) -> bool {
+        self.linearize.is_none() && self.inner.allow_direct_scanout()
+    }
+}
+
+impl<R> RenderElement<R> for LinearizedElement<R>
+where
+    R: AsGlowRenderer + Renderer + ImportAll + ImportMem,
+    R::TextureId: 'static,
+{
+    fn draw(
+        &self,
+        frame: &mut R::Frame<'_, '_>,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+        cache: Option<&UserDataMap>,
+    ) -> Result<(), R::Error> {
+        let Some((program, uniforms)) = &self.linearize else {
+            return self
+                .inner
+                .draw(frame, src, dst, damage, opaque_regions, cache);
+        };
+        // Same mechanism as ClippedSurfaceRenderElement::draw — install the
+        // linearize shader as the default tex program, draw the memory
+        // element through it, then restore.
+        BorrowMut::<GlesFrame>::borrow_mut(<R as AsGlowRenderer>::glow_frame_mut(frame))
+            .override_default_tex_program(program.clone(), uniforms.clone());
+        let res = self
+            .inner
+            .draw(frame, src, dst, damage, opaque_regions, cache);
+        BorrowMut::<GlesFrame>::borrow_mut(<R as AsGlowRenderer>::glow_frame_mut(frame))
+            .clear_tex_program_override();
+        res
+    }
+
+    fn underlying_storage(&self, renderer: &mut R) -> Option<UnderlyingStorage<'_>> {
+        if self.linearize.is_some() {
+            None
+        } else {
+            self.inner.underlying_storage(renderer)
+        }
     }
 }

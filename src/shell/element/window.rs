@@ -1,7 +1,7 @@
 use crate::{
     backend::render::{
         IndicatorShader, Key, Usage,
-        clipped_surface::ClippedSurfaceRenderElement,
+        clipped_surface::{ClippedSurfaceRenderElement, LinearizedElement},
         cursor::CursorState,
         element::{AsGlowRenderer, FromGlesError},
         shadow::ShadowShader,
@@ -603,9 +603,26 @@ impl CosmicWindow {
                     .0
                     .with_program(|p| p.window.geometry().loc)
                     .to_physical_precise_round(scale);
-            elements.extend(AsRenderElements::<R>::render_elements::<
+            let ssd_elements = AsRenderElements::<R>::render_elements::<
                 CosmicWindowRenderElement<R>,
-            >(&self.0, renderer, ssd_loc, scale, alpha))
+            >(&self.0, renderer, ssd_loc, scale, alpha);
+            // Path B — in an HDR render frame the header is a CPU-rendered
+            // memory buffer that, unlike client surfaces, doesn't pass
+            // through ClippedSurfaceRenderElement's linearize. Attach the
+            // linearize shader here so its sRGB pixels are decoded into the
+            // linear composite space before they hit the RGBA16F offscreen;
+            // otherwise the SSD titlebar renders as a solid white bar.
+            let needs_linearize = crate::backend::render::clipped_surface::render_hdr_active();
+            elements.extend(ssd_elements.into_iter().map(|elem| {
+                match elem {
+                    CosmicWindowRenderElement::Header(header) if needs_linearize => {
+                        CosmicWindowRenderElement::Header(
+                            header.into_path_b_linearized(renderer),
+                        )
+                    }
+                    other => other,
+                }
+            }));
         }
 
         elements.into_iter().map(C::from).collect()
@@ -1265,7 +1282,12 @@ impl WaylandFocus for CosmicWindow {
 }
 
 pub enum CosmicWindowRenderElement<R: Renderer + ImportAll + ImportMem> {
-    Header(MemoryRenderBufferRenderElement<R>),
+    /// Server-side-decoration header. Wrapped in `LinearizedElement` so it
+    /// can pick up the Path B HDR linearize shader — without it the header's
+    /// sRGB pixels skip the decode every surface gets and the postprocess
+    /// PQ-encode renders the titlebar as a solid peak-white bar on HDR
+    /// outputs. Passthrough (a plain memory element) outside Path B / HDR.
+    Header(LinearizedElement<R>),
     Shadow(PixelShaderElement),
     Border(PixelShaderElement),
     Window(WaylandSurfaceRenderElement<R>),
@@ -1276,7 +1298,7 @@ impl<R: Renderer + ImportAll + ImportMem> From<MemoryRenderBufferRenderElement<R
     for CosmicWindowRenderElement<R>
 {
     fn from(value: MemoryRenderBufferRenderElement<R>) -> Self {
-        Self::Header(value)
+        Self::Header(LinearizedElement::passthrough(value))
     }
 }
 
