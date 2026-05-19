@@ -1314,15 +1314,22 @@ impl KmsGuard<'_> {
                                                 .map(|p| (p as f32) / 100.0)
                                                 .unwrap_or(1.0);
                                             let degamma_lut = hw::srgb_decode_lut(degamma_size);
-                                            // Plain PQ encode in GAMMA_LUT — gamma slider is
-                                            // applied in the shader (color_mode=8), not baked
-                                            // into the LUT. Reason: live SIGUSR1 updates can't
-                                            // re-commit CRTC color blobs without triggering an
-                                            // atomic commit() per frame, which Intel xe rejects
-                                            // under motion (causes window-move glitches).
-                                            // Shader uniforms apply on next render frame for
-                                            // free, so sat/gamma stay there for live response.
-                                            let gamma_lut = hw::pq_encode_lut(gamma_size);
+                                            // Initial midtone + tone-map curve baked into the
+                                            // GAMMA_LUT. Live SIGUSR1 updates regen this blob
+                                            // with the current ref_white / midtone_gamma each
+                                            // time the user changes a slider — kode54's `1110f07d`
+                                            // ensures the kernel actually accepts the resulting
+                                            // atomic commits (earlier malformed-blob workaround
+                                            // is no longer needed).
+                                            let initial_midtone_gamma = hdr_midtone_gamma_setting
+                                                .map(|p| (p as f32) / 100.0)
+                                                .unwrap_or(0.7);
+                                            let gamma_lut = hw::pq_encode_lut_with_tonemap(
+                                                gamma_size,
+                                                initial_midtone_gamma,
+                                                content_ref_white,
+                                                lum.max_lum_nits,
+                                            );
                                             // CTM = gamut remap × ref_white scale, sat=1.0
                                             // (identity / no saturation in CTM). Saturation
                                             // also lives in the shader for the same reason.

@@ -201,6 +201,121 @@ pub fn pq_encode_lut_with_gamma(size: u32, gamma_raw: f32) -> Vec<DrmColorLutEnt
     lut
 }
 
+/// Build a GAMMA_LUT with a KWin-style modified-Reinhard tone-map curve
+/// baked in, plus the optional midtone gamma, plus PQ encoding.
+///
+/// Maps absolute luminance through a shoulder-controlled Reinhard curve
+/// before PQ encoding so SDR content sits at the user's reference white
+/// and content above ref_white rolls smoothly toward the panel's peak
+/// instead of clipping hard. Source: KDE KWin `src/opengl/colormanagement.glsl`
+/// `doTonemapping` (modified Reinhard). KWin operates per-luma in ICtCp
+/// space for chroma preservation; the GAMMA_LUT can only do per-channel,
+/// so we approximate. The chroma shift for desktop content is small (the
+/// curve is mostly linear in the SDR-and-below range), trades correctness
+/// for a 1D LUT we can update in real time.
+///
+/// Curve math (from KWin):
+///   inputRange  = source_peak / dest_ref       (sRGB content → 1.0)
+///   outputRange = dest_peak   / dest_ref
+///   v           = (outputRange * (1 + inputRange) - inputRange) / inputRange²
+///   x' = x * (1 + x * v) / (1 + x)
+///
+/// Net behavior:
+/// - At `x = 0`: slope is 1.0 (SDR linearity preserved through reference white)
+/// - At `x = inputRange`: maps exactly to `outputRange` (source peak →
+///   panel peak, no clipping)
+/// - panel_peak < ref_white: curve COMPRESSES (HDR-into-SDR-headroom case;
+///   e.g. user has ref_white=10000 and a 1500-nit panel → smooth roll-off)
+/// - panel_peak > ref_white: curve EXPANDS (the usual case; SDR content
+///   pushed up to panel peak)
+/// - panel_peak == ref_white: identity (no tone-mapping needed)
+///
+/// `gamma_raw` is the same midtone-punch knob the gamma-only variant uses,
+/// applied BEFORE the tone-map in linear space. With both at neutral
+/// (gamma=1.0, ref_white==panel_peak), this LUT reduces to `pq_encode_lut`.
+///
+/// `panel_peak_nits = 0` skips tone-mapping entirely and behaves identically
+/// to `pq_encode_lut_with_gamma`. Use that as a fallback when EDID mastering
+/// metadata isn't available.
+pub fn pq_encode_lut_with_tonemap(
+    size: u32,
+    gamma_raw: f32,
+    ref_white_nits: u16,
+    panel_peak_nits: u16,
+) -> Vec<DrmColorLutEntry> {
+    assert!(size >= 2, "LUT size must be at least 2");
+
+    // Fall through to the no-tone-map LUT if we have nothing to map against
+    // or the curve degenerates (panel can't be assumed brighter than 0).
+    if panel_peak_nits == 0 || ref_white_nits == 0 {
+        return pq_encode_lut_with_gamma(size, gamma_raw);
+    }
+
+    let n = size as usize;
+
+    const M1: f64 = 0.1593017578125;
+    const M2: f64 = 78.84375;
+    const C1: f64 = 0.8359375;
+    const C2: f64 = 18.8515625;
+    const C3: f64 = 18.6875;
+
+    let pq = |y: f64| -> f64 {
+        let y = y.max(0.0);
+        let ym = y.powf(M1);
+        let num = C1 + C2 * ym;
+        let den = 1.0 + C3 * ym;
+        (num / den).max(0.0).powf(M2)
+    };
+
+    // Midtone gamma: same 0.5× dampening as the gamma-only variant so the
+    // slider feels consistent regardless of which LUT builder is active.
+    let g = gamma_raw.max(0.1) as f64;
+    let g_eff = 1.0 + (g - 1.0) * 0.5;
+
+    // KWin curve params. inputRange == 1 in our usage: we assume source
+    // peak == ref_white (which is true for the desktop SDR case; HDR
+    // clients with their own image_description will bypass this path
+    // entirely once wp_color_management_v1 lands).
+    let dest_ref = ref_white_nits as f64;
+    let dest_peak = panel_peak_nits as f64;
+    let input_range = 1.0_f64;
+    let output_range = dest_peak / dest_ref;
+    let v_curve = (output_range * (1.0 + input_range) - input_range) / (input_range * input_range);
+
+    let mut lut = Vec::with_capacity(n);
+    for i in 0..n {
+        // LUT input x in [0,1] represents x * 10000 nits absolute (PQ's
+        // standard normalization). After CTM scaled by ref_white/10000, an
+        // sRGB-1.0 surface lands at x = ref_white/10000 → ref_white nits.
+        let x = i as f64 / (n - 1) as f64;
+
+        // 1. midtone gamma (linear-domain power curve).
+        let y_lifted = x.max(0.0).powf(g_eff);
+
+        // 2. tone-map in relative-luminance domain (rel = abs_nits/ref).
+        let abs_nits = y_lifted * 10000.0;
+        let rel = abs_nits / dest_ref;
+        let rel_out = if rel <= 0.0 {
+            0.0
+        } else {
+            rel * (1.0 + rel * v_curve) / (1.0 + rel)
+        };
+        let abs_nits_out = (rel_out * dest_ref).min(dest_peak);
+        let y_mapped = (abs_nits_out / 10000.0).clamp(0.0, 1.0);
+
+        // 3. PQ encode for the wire.
+        let pq_val = pq(y_mapped);
+        let q = (pq_val.clamp(0.0, 1.0) * 65535.0).round() as u16;
+        lut.push(DrmColorLutEntry {
+            red: q,
+            green: q,
+            blue: q,
+            reserved: 0,
+        });
+    }
+    lut
+}
+
 /// Build the CTM matrix combining gamut conversion with ref-white scaling.
 ///
 /// Output format matches the kernel's `struct drm_color_ctm`:

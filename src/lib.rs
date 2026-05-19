@@ -320,14 +320,30 @@ fn push_hdr_tuning_to_surfaces(state: &mut state::State) {
 
     let mut pushed = 0usize;
     for device in kms.drm_devices.values_mut() {
-        // (Live CTM/GAMMA_LUT regen on SIGUSR1 was tried, but couldn't
-        // be made stable on Intel xe under motion — re-committing the
-        // CRTC color pipeline blobs requires an atomic commit() per
-        // slider tick, which xe rejects intermittently and causes
-        // moving-window glitches. Reverted; sat/gamma live in shader
-        // uniforms instead, ref_white only updates on the next natural
-        // commit (mode change, vrr toggle, display reconfig). Phase 3
-        // protocols give us a cleaner per-surface live-update path.)
+        // Per-surface regen requests collected during the surface loop and
+        // applied after, so we can lock device.drm without fighting the
+        // outer iterator's mutable borrow.
+        //
+        // Live CTM + GAMMA_LUT regen is enabled now that kode54's `1110f07d`
+        // ensures all DRM property blobs we hand the kernel are correctly
+        // sized payload data (not 24-byte Vec headers). atomic_check accepts
+        // our commits, smithay's set_hdr_state diverges pending so the next
+        // render's commit() picks up the new blob IDs, and after that one
+        // commit pending == current so frames return to the fast page_flip
+        // path. Earlier attempts at this path had per-frame instability
+        // because the underlying blobs were malformed and the kernel was
+        // rejecting commits in subtle ways.
+        struct LiveRegen {
+            conn: smithay::reexports::drm::control::connector::Handle,
+            crtc: smithay::reexports::drm::control::crtc::Handle,
+            container: crate::backend::kms::drm_helpers::HdrColorContainer,
+            ref_white: u16,
+            gamut_mix: f32,
+            saturation: f32,
+            midtone_gamma: f32,
+            name: String,
+        }
+        let mut regens: Vec<LiveRegen> = Vec::new();
 
         for surface in device.inner.surfaces.values_mut() {
             let connector_name = surface.output.name();
@@ -396,8 +412,130 @@ fn push_hdr_tuning_to_surfaces(state: &mut state::State) {
                 );
                 surface.set_hdr_tuning(cs_for_shader, ref_white, gamut_mix, saturation, midtone_gamma, test_pattern);
 
+                // Queue a CTM + GAMMA_LUT regen so ref_white + gamut_mix
+                // changes (which live in the CTM blob, not shader uniforms)
+                // actually reach the kernel without requiring a relogin.
+                // Also re-bakes the GAMMA_LUT with the current midtone_gamma
+                // (and the tone-map curve once that's wired in).
+                let container = match cfg.hdr_colorspace {
+                    Some(cosmic_comp_config::output::comp::HdrColorspace::DciP3) =>
+                        crate::backend::kms::drm_helpers::HdrColorContainer::DciP3,
+                    _ => crate::backend::kms::drm_helpers::HdrColorContainer::Bt2020,
+                };
+                regens.push(LiveRegen {
+                    conn: surface.connector,
+                    crtc: surface.crtc,
+                    container,
+                    ref_white: ref_white as u16,
+                    gamut_mix,
+                    saturation,
+                    midtone_gamma,
+                    name: connector_name.clone(),
+                });
             }
             pushed += 1;
+        }
+
+        // Apply queued regens: lock the device's drm output manager, create
+        // new CTM + GAMMA_LUT blobs, splice into the existing HdrState (keep
+        // colorspace + metadata + DEGAMMA intact), push via set_hdr_state
+        // (which diverges pending → next render commits). Then schedule a
+        // render on each affected surface so the divergence actually fires.
+        if !regens.is_empty() {
+            use crate::backend::kms::drm_helpers;
+            use crate::backend::render::hw_color_pipeline as hw;
+            let mut regen_crtcs: Vec<smithay::reexports::drm::control::crtc::Handle> = Vec::new();
+            {
+                let mut drm_locked = device.drm.lock();
+                for r in regens {
+                    // 1. New CTM (gamut remap × ref_white scale × saturation).
+                    let ctm = hw::gamut_ctm_with_ref_white(
+                        r.container, r.ref_white, r.gamut_mix, r.saturation,
+                    );
+                    let new_ctm_blob =
+                        match drm_helpers::create_ctm_blob(drm_locked.device(), &ctm) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                warn!(?e, "[HDR-HW] live regen: create_ctm_blob failed for {}", r.name);
+                                continue;
+                            }
+                        };
+
+                    // 2. New GAMMA_LUT (midtone gamma + KWin-style modified
+                    // Reinhard tone-map + PQ encode). The tone-map curve
+                    // depends on ref_white, so a live update of ref_white
+                    // is BOTH a CTM regen (matrix scale factor) and a
+                    // GAMMA_LUT regen (curve shape). EDID-derived panel
+                    // peak comes from the same fallback the initial setup
+                    // uses (KWin pattern: panel-EDID rather than content-
+                    // mastering metadata).
+                    let gamma_size = drm_helpers::crtc_gamma_lut_size(
+                        drm_locked.device(),
+                        r.crtc,
+                    ).unwrap_or(1024);
+                    let panel_peak = drm_helpers::HdrMasteringLuminance::fallback_oled()
+                        .max_lum_nits;
+                    let gamma_lut = hw::pq_encode_lut_with_tonemap(
+                        gamma_size,
+                        r.midtone_gamma,
+                        r.ref_white,
+                        panel_peak,
+                    );
+                    let new_gamma_blob =
+                        match drm_helpers::create_color_lut_blob(drm_locked.device(), &gamma_lut) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                warn!(?e, "[HDR-HW] live regen: create_color_lut_blob (GAMMA) failed for {}", r.name);
+                                continue;
+                            }
+                        };
+
+                    // 3. Splice the new blobs into the existing HdrState and
+                    // push. Keeps connector colorspace + HDR_OUTPUT_METADATA
+                    // + DEGAMMA_LUT untouched.
+                    let comp_lock = match drm_locked.compositors().get(&r.crtc) {
+                        Some(c) => c,
+                        None => {
+                            warn!("[HDR-HW] live regen: no compositor for crtc {:?} ({})", r.crtc, r.name);
+                            continue;
+                        }
+                    };
+                    let comp = comp_lock.lock().unwrap();
+                    let prev_state = comp.surface().current_hdr_state().get(&r.conn).copied();
+                    let Some(prev) = prev_state else {
+                        warn!("[HDR-HW] live regen: no current HdrState for {} — HDR not enabled?", r.name);
+                        continue;
+                    };
+                    let new_state = smithay::backend::drm::HdrState {
+                        ctm_blob_id: Some(new_ctm_blob),
+                        gamma_lut_blob_id: Some(new_gamma_blob),
+                        ..prev
+                    };
+                    if let Err(e) = comp.surface().set_hdr_state(r.conn, Some(new_state)) {
+                        warn!(?e, "[HDR-HW] live regen: set_hdr_state failed for {}", r.name);
+                        continue;
+                    }
+                    warn!(
+                        "[HDR-HW] live regen for {}: ref_w={}n gamut={:.2} sat={:.2} gamma={:.2} ctm_blob={} gamma_blob={} container={:?}",
+                        r.name, r.ref_white, r.gamut_mix, r.saturation, r.midtone_gamma,
+                        new_ctm_blob, new_gamma_blob, r.container
+                    );
+                    regen_crtcs.push(r.crtc);
+                }
+                // drm_locked drops here.
+            }
+
+            // Schedule a render on each affected surface. The set_hdr_state
+            // we just called only updated `pending` — the next render's
+            // commit_pending() returns true and runs the full atomic
+            // commit(), which is what actually writes the new blob IDs to
+            // the kernel. Without this kick, an idle desktop would never
+            // commit and the new ref_white / gamut wouldn't take effect.
+            for surface in device.inner.surfaces.values() {
+                if regen_crtcs.contains(&surface.crtc) {
+                    surface.schedule_render();
+                }
+            }
         }
     }
 
