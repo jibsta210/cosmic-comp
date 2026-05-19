@@ -284,16 +284,29 @@ pub fn pq_encode_lut_with_tonemap(
 
     let mut lut = Vec::with_capacity(n);
     for i in 0..n {
-        // LUT input x in [0,1] represents x * 10000 nits absolute (PQ's
-        // standard normalization). After CTM scaled by ref_white/10000, an
-        // sRGB-1.0 surface lands at x = ref_white/10000 → ref_white nits.
+        // LUT input x in [0,1] represents linear-light intensity normalized to
+        // the user's reference white: x = 1.0 means "the brightness an sRGB
+        // surface labeled `#ffffff` should reach on the panel" = ref_white nits.
+        //
+        // This requires the CTM to be IDENTITY in the luminance dimension
+        // (i.e. CTM scale = 1.0, not ref_white/10000). The earlier design that
+        // scaled the CTM by ref_white/10000 squeezed the LUT input range to
+        // 0..(ref_white/10000) — for ref_white=200 that meant only ~21 out of
+        // 1024 LUT entries carried the entire SDR range, and the other 1000+
+        // mapped to the post-tone-map clamp. Result: heavy banding in the
+        // bright midtones where the curve has its steepest slope. With CTM
+        // scale=1.0 and the ref_white→nits map living entirely in this LUT,
+        // all 1024 entries cover the SDR range and the curve resolution is
+        // ~9× finer per nit even at ref_white=200.
         let x = i as f64 / (n - 1) as f64;
 
         // 1. midtone gamma (linear-domain power curve).
         let y_lifted = x.max(0.0).powf(g_eff);
 
         // 2. tone-map in relative-luminance domain (rel = abs_nits/ref).
-        let abs_nits = y_lifted * 10000.0;
+        // y_lifted=1.0 maps to ref_white nits absolute, exactly the
+        // semantic the CTM-scale-1.0 design promises.
+        let abs_nits = y_lifted * dest_ref;
         let rel = abs_nits / dest_ref;
         let rel_out = if rel <= 0.0 {
             0.0
@@ -426,16 +439,24 @@ pub fn gamut_ctm_with_ref_white(
         }
     }
 
-    // PQ normalizes 0..1 input as 0..10000 nits. We want sRGB white = 1.0
-    // to encode to ref_white_nits, so scale every matrix entry by
-    // ref_white / 10000 here (folds into a single CTM op).
-    let scale = ref_white_nits as f64 / 10000.0;
-
+    // CTM scale is 1.0 — the ref_white → absolute nits mapping lives entirely
+    // in the GAMMA_LUT now (see pq_encode_lut_with_tonemap). This gives the
+    // LUT its full 1024-entry input range to represent the SDR luminance
+    // curve at high precision; the previous design that baked ref_white/10000
+    // into the CTM left the LUT with only ~21 entries covering the SDR range
+    // for typical ref_white values (200-300 nits), which caused severe
+    // posterization / banding in midtone luminances after the tone-mapping
+    // landed.
+    //
+    // `ref_white_nits` stays in the function signature for API stability —
+    // existing callers don't need to change — but the value is unused here.
+    // The LUT builder reads it (and panel_peak) directly to parameterize the
+    // tone-map curve.
+    let _ = ref_white_nits; // intentionally unused; LUT owns ref-white mapping
     let mut out = [0u64; 9];
     for row in 0..3 {
         for col in 0..3 {
-            let scaled = m_combined[row][col] * scale;
-            out[row * 3 + col] = encode_s31_32_sign_magnitude(scaled);
+            out[row * 3 + col] = encode_s31_32_sign_magnitude(m_combined[row][col]);
         }
     }
     out
@@ -534,43 +555,34 @@ mod tests {
     }
 
     #[test]
-    fn ctm_scales_with_ref_white() {
-        // ref_white = 200 should scale every entry to 1/50 of the 10000 case.
-        let ctm_full = gamut_ctm_with_ref_white(HdrColorContainer::Bt2020, 10000, 1.0, 1.0);
-        let ctm_200 = gamut_ctm_with_ref_white(HdrColorContainer::Bt2020, 200, 1.0, 1.0);
-        // [0][0] full scale
-        let full_00 = (ctm_full[0] & !(1u64 << 63)) as f64 / 4_294_967_296.0;
-        let scaled_00 = (ctm_200[0] & !(1u64 << 63)) as f64 / 4_294_967_296.0;
-        // Should be close to full * 200/10000 = full * 0.02
-        let expected = full_00 * 0.02;
-        let diff = (scaled_00 - expected).abs();
-        assert!(
-            diff < 1e-5,
-            "ref_white scaling off: scaled={} expected={} diff={}",
-            scaled_00,
-            expected,
-            diff
-        );
+    fn ctm_ignores_ref_white_param() {
+        // ref_white was previously baked into the CTM as a scale factor;
+        // it now lives in the GAMMA_LUT (see pq_encode_lut_with_tonemap).
+        // CTMs for any two ref_white values with the same gamut_mix + sat
+        // must be byte-identical.
+        let ctm_a = gamut_ctm_with_ref_white(HdrColorContainer::Bt2020, 200, 1.0, 1.0);
+        let ctm_b = gamut_ctm_with_ref_white(HdrColorContainer::Bt2020, 10000, 1.0, 1.0);
+        assert_eq!(ctm_a, ctm_b, "CTM must not depend on ref_white anymore");
     }
 
     #[test]
-    fn ctm_gamut_mix_zero_is_identity_scaled() {
-        // gamut_mix = 0 → 709 passthrough × ref_white scale.
-        // [0][0] should be 1.0 * ref_white/10000, [0][1] should be 0.
+    fn ctm_gamut_mix_zero_is_identity() {
+        // gamut_mix = 0 → 709 passthrough, no scale.
+        // [0][0] should be exactly 1.0, [0][1] should be 0.
         let ctm = gamut_ctm_with_ref_white(HdrColorContainer::Bt2020, 1000, 0.0, 1.0);
         let m00 = (ctm[0] & !(1u64 << 63)) as f64 / 4_294_967_296.0;
         let m01 = (ctm[1] & !(1u64 << 63)) as f64 / 4_294_967_296.0;
-        assert!((m00 - 0.1).abs() < 1e-5, "[0][0] should be 0.1, got {}", m00);
+        assert!((m00 - 1.0).abs() < 1e-5, "[0][0] should be 1.0, got {}", m00);
         assert!(m01 < 1e-5, "[0][1] should be ~0, got {}", m01);
     }
 
     #[test]
     fn ctm_gamut_mix_half() {
         // gamut_mix = 0.5 → halfway between identity and full BT.2020 remap.
-        // [0][0] should be (1.0 + 0.6274) / 2 = 0.8137, scaled by 0.1
+        // [0][0] should be (1.0 + 0.6274) / 2 = 0.8137, no scaling now.
         let ctm = gamut_ctm_with_ref_white(HdrColorContainer::Bt2020, 1000, 0.5, 1.0);
         let m00 = (ctm[0] & !(1u64 << 63)) as f64 / 4_294_967_296.0;
-        let expected = ((1.0 + 0.62740389896) / 2.0) * 0.1;
+        let expected = (1.0 + 0.62740389896) / 2.0;
         assert!(
             (m00 - expected).abs() < 1e-5,
             "[0][0] half-mix should be {}, got {}",
